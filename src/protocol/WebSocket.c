@@ -132,20 +132,22 @@ void swWebSocket_encode(swString *buffer, char *data, size_t length, char opcode
     {
         if (mask)
         {
+            char *_mask_data = SW_WEBSOCKET_MASK_DATA;
+            swString_append_ptr(buffer, _mask_data, SW_WEBSOCKET_MASK_LEN);
+
+            char *_data = buffer->str + buffer->length;
+            swString_append_ptr(buffer, data, length);
+
             int i;
-            char masks[SW_WEBSOCKET_MASK_LEN];
-            for (i = 0; i < SW_WEBSOCKET_MASK_LEN; i++)
-            {
-                srand((int) time(0));
-                masks[i] = (rand() % 26) + 'a';
-                frame_header[pos++] = masks[i];
-            }
             for (i = 0; i < length; i++)
             {
-                data[i] ^= masks[i % SW_WEBSOCKET_MASK_LEN];
+                _data[i] ^= _mask_data[i % SW_WEBSOCKET_MASK_LEN];
             }
         }
-        swString_append_ptr(buffer, data, length);
+        else
+        {
+            swString_append_ptr(buffer, data, length);
+        }
     }
 }
 
@@ -252,7 +254,7 @@ int swWebSocket_dispatch_frame(swConnection *conn, char *data, uint32_t length)
 
     case WEBSOCKET_OPCODE_TEXT_FRAME:
     case WEBSOCKET_OPCODE_BINARY_FRAME:
-        offset = length - ws.payload_length - 2;
+        offset = length - ws.payload_length - SW_WEBSOCKET_HEADER_LEN;
         data[offset] = 1;
         data[offset + 1] = ws.header.OPCODE;
         if (!ws.header.FIN)
@@ -271,18 +273,19 @@ int swWebSocket_dispatch_frame(swConnection *conn, char *data, uint32_t length)
         break;
 
     case WEBSOCKET_OPCODE_PING:
-        if (length >= (sizeof(buf) - 2))
+        if (length >= (sizeof(buf) - SW_WEBSOCKET_HEADER_LEN))
         {
             swWarn("ping frame application data is too big. remote_addr=%s:%d.", swConnection_get_ip(conn), swConnection_get_port(conn));
             return SW_ERR;
         }
-        else if (length == 2)
+        else if (length == SW_WEBSOCKET_HEADER_LEN)
         {
             swWebSocket_encode(&send_frame, NULL, 0, WEBSOCKET_OPCODE_PONG, 1, 0);
         }
         else
         {
-            swWebSocket_encode(&send_frame, data += 2, length - 2, WEBSOCKET_OPCODE_PONG, 1, 0);
+            offset = ws.header.MASK ? SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_MASK_LEN : SW_WEBSOCKET_HEADER_LEN;
+            swWebSocket_encode(&send_frame, data += offset, length - offset, WEBSOCKET_OPCODE_PONG, 1, 0);
         }
         swConnection_send(conn, send_frame.str, send_frame.length, 0);
         break;

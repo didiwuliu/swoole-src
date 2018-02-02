@@ -30,6 +30,8 @@ $http->set([
 //'daemonize' => true,
 //    'ssl_cert_file' => $key_dir.'/ssl.crt',
 //    'ssl_key_file' => $key_dir.'/ssl.key',
+    'enable_static_handler' => true,
+    'document_root' => '/home/htf/workspace/php/www.swoole.com/web/'
 ]);
 
 $http->listen('127.0.0.1', 9502, SWOOLE_SOCK_TCP);
@@ -70,6 +72,24 @@ function no_chunk(swoole_http_request $request, swoole_http_response $response)
     {
         $response->header('Content-Type', 'image/jpeg');
         $response->sendfile(dirname(__DIR__).'/test.jpg');
+        return;
+    }
+    if ($request->server['request_uri'] == '/test.txt')
+    {
+        $last_modified_time = filemtime(__DIR__ . '/test.txt');
+        $etag = md5_file(__DIR__ . '/test.txt');
+        // always send headers
+        $response->header("Last-Modified", gmdate("D, d M Y H:i:s", $last_modified_time) . " GMT");
+        $response->header("Etag", $etag);
+        if (strtotime($request->header['if-modified-since']) == $last_modified_time or trim($request->header['if-none-match']) == $etag)
+        {
+            $response->status(304);
+            $response->end();
+        }
+        else
+        {
+            $response->sendfile(__DIR__ . '/test.txt');
+        }
         return;
     }
     if ($request->server['request_uri'] == '/favicon.ico')

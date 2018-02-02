@@ -5,27 +5,27 @@ class G
     static $serv;
     static $config = array(
         //'reactor_num'              => 16,     // 线程数. 一般设置为CPU核数的1-4倍
-        'worker_num'               => 1,    // 工作进程数量. 设置为CPU的1-4倍最合理
-        'max_request'              => 0,     // 防止 PHP 内存溢出, 一个工作进程处理 X 次任务后自动重启 (注: 0,不自动重启)
+        'worker_num'               => 2,    // 工作进程数量. 设置为CPU的1-4倍最合理
+        'max_request'              => 1000,     // 防止 PHP 内存溢出, 一个工作进程处理 X 次任务后自动重启 (注: 0,不自动重启)
         'max_conn'                 => 10000, // 最大连接数
         'task_worker_num'          => 1,     // 任务工作进程数量
 //        'task_ipc_mode'            => 2,     // 设置 Task 进程与 Worker 进程之间通信的方式。
         'task_max_request'         => 0,     // 防止 PHP 内存溢出
-        'task_tmpdir'              => '/tmp',
+        //'task_tmpdir'              => '/tmp',
         //'message_queue_key'        => ftok(SYS_ROOT . 'queue.msg', 1),
         'dispatch_mode'            => 2,
         //'daemonize'                => 1,     // 设置守护进程模式
         'backlog'                  => 128,
         //'log_file'                 => '/data/logs/swoole.log',
-        //'heartbeat_check_interval' => 10,    // 心跳检测间隔时长(秒)
-        //'heartbeat_idle_time'      => 20,   // 连接最大允许空闲的时间
+        'heartbeat_check_interval' => 10,    // 心跳检测间隔时长(秒)
+        'heartbeat_idle_time'      => 20,   // 连接最大允许空闲的时间
         //'open_eof_check'           => 1,
         //'open_eof_split'           => 1,
         //'package_eof'              => "\r\r\n",
         //'open_cpu_affinity'        => 1,
         'socket_buffer_size'         => 1024 * 1024 * 128,
         'buffer_output_size'         => 1024 * 1024 * 2,
-        //'enable_delay_receive'       => true,
+        'enable_delay_receive'       => true,
         //'cpu_affinity_ignore' =>array(0,1)//如果你的网卡2个队列（或者没有多队列那么默认是cpu0来处理中断）,并且绑定了core 0和core 1,那么可以通过这个设置避免swoole的线程或者进程绑定到这2个core，防止cpu0，1被耗光而造成的丢包
     );
 
@@ -55,8 +55,8 @@ if (isset($argv[1]) and $argv[1] == 'daemon') {
     G::$config['daemonize'] = false;
 }
 
-$mode = SWOOLE_BASE;
-//$mode = SWOOLE_PROCESS;
+//$mode = SWOOLE_BASE;
+$mode = SWOOLE_PROCESS;
 
 $serv = new swoole_server("0.0.0.0", 9501, $mode, SWOOLE_SOCK_TCP);
 $serv->listen('0.0.0.0', 9502, SWOOLE_SOCK_UDP);
@@ -91,6 +91,8 @@ $process2 = new swoole_process(function ($worker) use ($serv) {
 
 //$serv->addprocess($process2);
 $serv->set(G::$config);
+$serv->set(['reactor_num' => 4]);
+
 /**
  * 使用类的静态属性，可以直接访问
  */
@@ -196,9 +198,9 @@ function my_onConnect(swoole_server $serv, $fd, $from_id)
 //    var_dump($serv->connection_info($fd));
     //var_dump($serv, $fd, $from_id);
 //    echo "Worker#{$serv->worker_pid} Client[$fd@$from_id]: Connect.\n";
-    //$serv->after(2000, function() use ($serv, $fd) {
-    //    $serv->confirm($fd);
-    //});
+    $serv->after(2000, function() use ($serv, $fd) {
+        $serv->confirm($fd);
+    });
     my_log("Client: Connect --- {$fd}");
 }
 
@@ -206,6 +208,18 @@ function timer_show($id)
 {
     my_log("Timer#$id");
 }
+
+function my_onWorkerExit(swoole_server $serv, $worker_id) {
+    $redisState = $serv->redis->getState();
+    global $argv;
+    if ($redisState == Swoole\Redis::STATE_READY or $redisState == Swoole\Redis::STATE_SUBSCRIBE)
+    {
+        swoole_set_process_name("php {$argv[0]}: worker shutting down");
+        echo "exit\n";
+        //$serv->redis->close();
+    }
+}
+
 function my_onWorkerStart(swoole_server $serv, $worker_id)
 {
 	processRename($serv, $worker_id);
@@ -218,6 +232,17 @@ function my_onWorkerStart(swoole_server $serv, $worker_id)
         $serv->defer(function(){
            echo "defer call\n";
         });
+//        $serv->tick(2000, function() use ($serv) {
+//           echo "Worker-{$serv->worker_id} tick-2000\n";
+//        });
+
+        $redis = new Swoole\Redis();
+        $redis->connect("127.0.0.1", 6379, function ($redis, $r) {
+           $redis->get("key", function ($redis, $r) {
+               var_dump($r);
+           });
+        });
+        $serv->redis = $redis;
     }
     else
     {
@@ -271,6 +296,10 @@ function my_onReceive(swoole_server $serv, $fd, $from_id, $data)
     {
         $serv->task("send " . $fd);
     }
+    elseif ($cmd == "bigtask")
+    {
+        $serv->task(str_repeat('A', 8192*5));
+    }
     elseif($cmd == "taskwait")
     {
         $result = $serv->taskwait("taskwait");
@@ -278,6 +307,27 @@ function my_onReceive(swoole_server $serv, $fd, $from_id, $data)
         	$serv->send($fd, "taskwaitok");
         }
         echo "SyncTask: result=".var_export($result, true)."\n";
+    }
+    elseif($cmd == "taskWaitMulti")
+    {
+        $result = $serv->taskWaitMulti(array(
+            str_repeat('A', 8192 * 5),
+            str_repeat('B', 8192 * 6),
+            str_repeat('C', 8192 * 8)
+        ));
+        if ($result)
+        {
+            $resp = "taskWaitMulti ok\n";
+            foreach($result as $k => $v)
+            {
+                $resp .= "result[$k] length=".strlen($v)."\n";
+            }
+            $serv->send($fd, $resp);
+        }
+        else
+        {
+            $serv->send($fd, "taskWaitMulti error\n");
+        }
     }
     elseif ($cmd == "hellotask")
     {
@@ -373,16 +423,6 @@ function my_onReceive(swoole_server $serv, $fd, $from_id, $data)
     {
         exit("worker php exit.\n");
     }
-    elseif ($cmd == 'pause')
-    {
-        echo "pause receive data. fd={$fd}\n";
-        $serv->pause($fd);
-    }
-    elseif(substr($cmd, 0, 6) == "resume")
-    {
-        $resume_fd = substr($cmd, 7);
-        $serv->resume($resume_fd);
-    }
     //关闭fd
     elseif(substr($cmd, 0, 5) == "close")
     {
@@ -449,6 +489,11 @@ function my_onTask(swoole_server $serv, $task_id, $from_id, $data)
         elseif ($cmd[0] == 'close')
         {
             $serv->close($cmd[1]);
+        }
+        else
+        {
+            echo "bigtask: length=".strlen($data)."\n";
+            return $data;
         }
 //        $serv->sendto('127.0.0.1', 9999, "hello world");
         //swoole_timer_after(1000, "test");
@@ -528,6 +573,7 @@ $serv->on('WorkerStop', 'my_onWorkerStop');
 $serv->on('Task', 'my_onTask');
 $serv->on('Finish', 'my_onFinish');
 $serv->on('WorkerError', 'my_onWorkerError');
+$serv->on('WorkerExit', 'my_onWorkerExit');
 $serv->on('ManagerStart', function($serv) {
     global $argv;
     swoole_set_process_name("php {$argv[0]}: manager");

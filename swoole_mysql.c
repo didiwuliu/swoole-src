@@ -19,10 +19,22 @@
 #include "php_swoole.h"
 #include "swoole_mysql.h"
 
+#ifdef SW_USE_MYSQLND
+#include "ext/mysqlnd/mysqlnd.h"
+#include "ext/mysqlnd/mysqlnd_charset.h"
+#endif
+
 static PHP_METHOD(swoole_mysql, __construct);
 static PHP_METHOD(swoole_mysql, __destruct);
 static PHP_METHOD(swoole_mysql, connect);
+#ifdef SW_USE_MYSQLND
+static PHP_METHOD(swoole_mysql, escape);
+#endif
 static PHP_METHOD(swoole_mysql, query);
+static PHP_METHOD(swoole_mysql, begin);
+static PHP_METHOD(swoole_mysql, commit);
+static PHP_METHOD(swoole_mysql, rollback);
+static PHP_METHOD(swoole_mysql, getState);
 static PHP_METHOD(swoole_mysql, close);
 static PHP_METHOD(swoole_mysql, on);
 
@@ -247,31 +259,93 @@ static const mysql_charset swoole_mysql_charsets[] =
     { 0, NULL, NULL},
 };
 
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_void, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_mysql_on, 0, 0, 2)
+    ZEND_ARG_INFO(0, event_name)
+    ZEND_ARG_INFO(0, callback)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_mysql_connect, 0, 0, 2)
+    ZEND_ARG_ARRAY_INFO(0, server_config, 0)
+    ZEND_ARG_INFO(0, callback)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_mysql_begin, 0, 0, 1)
+    ZEND_ARG_INFO(0, callback)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_mysql_commit, 0, 0, 1)
+    ZEND_ARG_INFO(0, callback)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_mysql_rollback, 0, 0, 1)
+    ZEND_ARG_INFO(0, callback)
+ZEND_END_ARG_INFO()
+
+#ifdef SW_USE_MYSQLND
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_mysql_escape, 0, 0, 1)
+    ZEND_ARG_INFO(0, string)
+    ZEND_ARG_INFO(0, flags)
+ZEND_END_ARG_INFO()
+#endif
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_mysql_query, 0, 0, 2)
+    ZEND_ARG_INFO(0, sql)
+    ZEND_ARG_INFO(0, callback)
+ZEND_END_ARG_INFO()
+
 static const zend_function_entry swoole_mysql_methods[] =
 {
-    PHP_ME(swoole_mysql, __construct, NULL, ZEND_ACC_PUBLIC | ZEND_ACC_CTOR)
-    PHP_ME(swoole_mysql, __destruct, NULL, ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
-    PHP_ME(swoole_mysql, connect, NULL, ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_mysql, query, NULL, ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_mysql, close, NULL, ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_mysql, on, NULL, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_mysql, __construct, arginfo_swoole_void, ZEND_ACC_PUBLIC | ZEND_ACC_CTOR)
+    PHP_ME(swoole_mysql, __destruct, arginfo_swoole_void, ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
+    PHP_ME(swoole_mysql, connect, arginfo_swoole_mysql_connect, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_mysql, begin, arginfo_swoole_mysql_begin, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_mysql, commit, arginfo_swoole_mysql_commit, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_mysql, rollback, arginfo_swoole_mysql_rollback, ZEND_ACC_PUBLIC)
+#ifdef SW_USE_MYSQLND
+    PHP_ME(swoole_mysql, escape, arginfo_swoole_mysql_escape, ZEND_ACC_PUBLIC)
+#endif
+    PHP_ME(swoole_mysql, query, arginfo_swoole_mysql_query, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_mysql, close, arginfo_swoole_void, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_mysql, getState, arginfo_swoole_void, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_mysql, on, arginfo_swoole_mysql_on, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
-static int mysql_request(swString *sql, swString *buffer);
-static int mysql_handshake(mysql_connector *connector, char *buf, int len);
-static int mysql_get_result(mysql_connector *connector, char *buf, int len);
-static int mysql_get_charset(char *name);
 static void mysql_client_free(mysql_client *client, zval* zobject);
+static void mysql_columns_free(mysql_client *client);
 
 static void mysql_client_free(mysql_client *client, zval* zobject)
 {
+    if (client->cli->timer)
+    {
+        swTimer_del(&SwooleG.timer, client->cli->timer);
+        client->cli->timer = NULL;
+    }
     //close the connection
     client->cli->close(client->cli);
     //release client object memory
     swClient_free(client->cli);
     efree(client->cli);
     client->cli = NULL;
+    client->connected = 0;
+}
+
+static void mysql_columns_free(mysql_client *client)
+{
+    int i;
+    for (i = 0; i < client->response.num_column; i++)
+    {
+        if (client->response.columns[i].buffer)
+        {
+            efree(client->response.columns[i].buffer);
+            client->response.columns[i].buffer = NULL;
+        }
+    }
+    efree(client->response.columns);
 }
 
 #ifdef SW_MYSQL_DEBUG
@@ -279,13 +353,13 @@ static void mysql_client_info(mysql_client *client);
 static void mysql_column_info(mysql_field *field);
 #endif
 
+static void swoole_mysql_onTimeout(swTimer *timer, swTimer_node *tnode);
 static int swoole_mysql_onRead(swReactor *reactor, swEvent *event);
 static int swoole_mysql_onWrite(swReactor *reactor, swEvent *event);
 static int swoole_mysql_onError(swReactor *reactor, swEvent *event);
 static void swoole_mysql_onConnect(mysql_client *client TSRMLS_DC);
 
-static swString *mysql_request_buffer = NULL;
-static int isset_event_callback = 0;
+swString *mysql_request_buffer = NULL;
 
 void swoole_mysql_init(int module_number TSRMLS_DC)
 {
@@ -296,9 +370,31 @@ void swoole_mysql_init(int module_number TSRMLS_DC)
     SWOOLE_INIT_CLASS_ENTRY(swoole_mysql_exception_ce, "swoole_mysql_exception", "Swoole\\MySQL\\Exception", NULL);
     swoole_mysql_exception_class_entry_ptr = sw_zend_register_internal_class_ex(&swoole_mysql_exception_ce, zend_exception_get_default(TSRMLS_C), NULL TSRMLS_CC);
     SWOOLE_CLASS_ALIAS(swoole_mysql_exception, "Swoole\\MySQL\\Exception");
+
+    zend_declare_property_null(swoole_mysql_class_entry_ptr, ZEND_STRL("serverInfo"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_mysql_class_entry_ptr, ZEND_STRL("sock"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_bool(swoole_mysql_class_entry_ptr, ZEND_STRL("connected"), 0, ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_long(swoole_mysql_class_entry_ptr, ZEND_STRL("errno"), 0, ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_long(swoole_mysql_class_entry_ptr, ZEND_STRL("connect_errno"), 0, ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_mysql_class_entry_ptr, ZEND_STRL("error"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_mysql_class_entry_ptr, ZEND_STRL("connect_error"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_mysql_class_entry_ptr, ZEND_STRL("insert_id"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_mysql_class_entry_ptr, ZEND_STRL("affected_rows"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    /**
+     * event callback
+     */
+    zend_declare_property_null(swoole_mysql_class_entry_ptr, ZEND_STRL("onConnect"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_mysql_class_entry_ptr, ZEND_STRL("onClose"), ZEND_ACC_PUBLIC TSRMLS_CC);
+
+    zend_declare_class_constant_long(swoole_mysql_class_entry_ptr, SW_STRL("STATE_QUERY")-1, SW_MYSQL_STATE_QUERY TSRMLS_CC);
+    zend_declare_class_constant_long(swoole_mysql_class_entry_ptr, SW_STRL("STATE_READ_START")-1, SW_MYSQL_STATE_READ_START TSRMLS_CC);
+    zend_declare_class_constant_long(swoole_mysql_class_entry_ptr, SW_STRL("STATE_READ_FIELD ")-1, SW_MYSQL_STATE_READ_FIELD TSRMLS_CC);
+    zend_declare_class_constant_long(swoole_mysql_class_entry_ptr, SW_STRL("STATE_READ_ROW")-1, SW_MYSQL_STATE_READ_ROW TSRMLS_CC);
+    zend_declare_class_constant_long(swoole_mysql_class_entry_ptr, SW_STRL("STATE_READ_END")-1, SW_MYSQL_STATE_READ_END TSRMLS_CC);
+    zend_declare_class_constant_long(swoole_mysql_class_entry_ptr, SW_STRL("STATE_CLOSED")-1, SW_MYSQL_STATE_CLOSED TSRMLS_CC);
 }
 
-static int mysql_request(swString *sql, swString *buffer)
+int mysql_request(swString *sql, swString *buffer)
 {
     bzero(buffer->str, 5);
     //length
@@ -309,7 +405,18 @@ static int mysql_request(swString *sql, swString *buffer)
     return swString_append(buffer, sql);
 }
 
-static int mysql_get_charset(char *name)
+int mysql_prepare(swString *sql, swString *buffer)
+{
+    bzero(buffer->str, 5);
+    //length
+    mysql_pack_length(sql->length + 1, buffer->str);
+    //command
+    buffer->str[4] = SW_MYSQL_COM_STMT_PREPARE;
+    buffer->length = 5;
+    return swString_append(buffer, sql);
+}
+
+int mysql_get_charset(char *name)
 {
     const mysql_charset *c = swoole_mysql_charsets;
     while (c[0].nr != 0)
@@ -323,7 +430,7 @@ static int mysql_get_charset(char *name)
     return -1;
 }
 
-static int mysql_get_result(mysql_connector *connector, char *buf, int len)
+int mysql_get_result(mysql_connector *connector, char *buf, int len)
 {
     char *tmp = buf;
     int packet_length = mysql_uint3korr(tmp);
@@ -374,7 +481,7 @@ string[$len]   auth-plugin-data-part-2 ($len=MAX(13, length of auth-plugin-data 
 string[NUL]    auth-plugin name
   }
  */
-static int mysql_handshake(mysql_connector *connector, char *buf, int len)
+int mysql_handshake(mysql_connector *connector, char *buf, int len)
 {
     char *tmp = buf;
 
@@ -467,6 +574,12 @@ static int mysql_handshake(mysql_connector *connector, char *buf, int len)
     memcpy(tmp, &value, sizeof(value));
     tmp += 4;
 
+    //use the server character_set when the character_set is not set.
+    if (connector->character_set == 0)
+    {
+        connector->character_set = request.character_set;
+    }
+
     //character set
     *tmp = connector->character_set;
     tmp += 1;
@@ -479,37 +592,45 @@ static int mysql_handshake(mysql_connector *connector, char *buf, int len)
     tmp[connector->user_len] = '\0';
     tmp += (connector->user_len + 1);
 
-    //auth-response
-    char hash_0[20];
-    bzero(hash_0, sizeof(hash_0));
-    php_swoole_sha1(connector->password, connector->password_len, (uchar *) hash_0);
-
-    char hash_1[20];
-    bzero(hash_1, sizeof(hash_1));
-    php_swoole_sha1(hash_0, sizeof(hash_0), (uchar *) hash_1);
-
-    char str[40];
-    memcpy(str, request.auth_plugin_data, 20);
-    memcpy(str + 20, hash_1, 20);
-
-    char hash_2[20];
-    php_swoole_sha1(str, sizeof(str), (uchar *) hash_2);
-
-    char hash_3[20];
-
-    int *a = (int *) hash_2;
-    int *b = (int *) hash_0;
-    int *c = (int *) hash_3;
-
-    int i;
-    for (i = 0; i < 5; i++)
+    if (connector->password_len > 0)
     {
-        c[i] = a[i] ^ b[i];
-    }
+        //auth-response
+        char hash_0[20];
+        bzero(hash_0, sizeof (hash_0));
+        php_swoole_sha1(connector->password, connector->password_len, (uchar *) hash_0);
 
-    *tmp = 20;
-    memcpy(tmp + 1, hash_3, 20);
-    tmp += 21;
+        char hash_1[20];
+        bzero(hash_1, sizeof (hash_1));
+        php_swoole_sha1(hash_0, sizeof (hash_0), (uchar *) hash_1);
+
+        char str[40];
+        memcpy(str, request.auth_plugin_data, 20);
+        memcpy(str + 20, hash_1, 20);
+
+        char hash_2[20];
+        php_swoole_sha1(str, sizeof (str), (uchar *) hash_2);
+
+        char hash_3[20];
+
+        int *a = (int *) hash_2;
+        int *b = (int *) hash_0;
+        int *c = (int *) hash_3;
+
+        int i;
+        for (i = 0; i < 5; i++)
+        {
+            c[i] = a[i] ^ b[i];
+        }
+
+        *tmp = 20;
+        memcpy(tmp + 1, hash_3, 20);
+        tmp += 21;
+    }
+    else
+    {
+         *tmp = 0;
+         tmp++;
+    }
 
     //string[NUL]    database
     memcpy(tmp, connector->database, connector->database_len);
@@ -528,7 +649,820 @@ static int mysql_handshake(mysql_connector *connector, char *buf, int len)
     return 1;
 }
 
-static int mysql_response(mysql_client *client)
+static int mysql_parse_prepare_result(mysql_client *client, char *buf, size_t n_buf)
+{
+    if (n_buf < 11)
+    {
+        return SW_ERR;
+    }
+
+    mysql_statement *stmt = emalloc(sizeof(mysql_statement));
+    stmt->id = mysql_uint4korr(buf);
+    buf += 4;
+    stmt->field_count = mysql_uint2korr(buf);
+    buf += 2;
+    stmt->unreaded_param_count = stmt->param_count = mysql_uint2korr(buf);
+    buf += 2;
+    //skip 1 byte
+    buf += 1;
+    stmt->warning_count = mysql_uint2korr(buf);
+    client->statement = stmt;
+    stmt->client = client;
+
+    swTraceLog(SW_TRACE_MYSQL_CLIENT, "id=%d, field_count=%d, param_count=%d, warning_count=%d.", stmt->id, stmt->field_count, stmt->param_count,
+            stmt->warning_count);
+
+    return 11;
+}
+
+static int mysql_decode_row(mysql_client *client, char *buf, int packet_len)
+{
+    int read_n = 0, i;
+    int tmp_len;
+    ulong_t len;
+    char nul;
+
+    mysql_row row;
+    char value_buffer[32];
+    bzero(&row, sizeof(row));
+    char *error;
+    //unused
+    //char mem;
+
+    zval *result_array = client->response.result_array;
+    zval *row_array = NULL;
+    SW_ALLOC_INIT_ZVAL(row_array);
+    array_init(row_array);
+
+    swTraceLog(SW_TRACE_MYSQL_CLIENT, "mysql_decode_row begin, num_column=%d, packet_len=%d.", client->response.num_column, packet_len);
+
+    for (i = 0; i < client->response.num_column; i++)
+    {
+        tmp_len = mysql_length_coded_binary(&buf[read_n], &len, &nul, packet_len - read_n);
+        if (tmp_len == -1)
+        {
+            return -SW_MYSQL_ERR_BAD_LCB;
+        }
+
+        read_n += tmp_len;
+        if (read_n + len > packet_len)
+        {
+            return -SW_MYSQL_ERR_LEN_OVER_BUFFER;
+        }
+
+        swTraceLog(SW_TRACE_MYSQL_CLIENT, "n=%d, fname=%s, name_length=%d", i, client->response.columns[i].name,
+                client->response.columns[i].name_length);
+
+        if (nul == 1)
+        {
+            add_assoc_null(row_array, client->response.columns[i].name);
+            continue;
+        }
+
+        int type = client->response.columns[i].type;
+
+        swTraceLog(SW_TRACE_MYSQL_CLIENT, "value: name=%s, type=%d, value=%s, len=%ld",
+                client->response.columns[i].name, type, swoole_strndup(buf + read_n, len), len);
+
+        switch (type)
+        {
+        case SW_MYSQL_TYPE_NULL:
+            add_assoc_null(row_array, client->response.columns[i].name);
+            break;
+        /* String */
+        case SW_MYSQL_TYPE_TINY_BLOB:
+        case SW_MYSQL_TYPE_MEDIUM_BLOB:
+        case SW_MYSQL_TYPE_LONG_BLOB:
+        case SW_MYSQL_TYPE_BLOB:
+        case SW_MYSQL_TYPE_DECIMAL:
+        case SW_MYSQL_TYPE_NEWDECIMAL:
+        case SW_MYSQL_TYPE_BIT:
+        case SW_MYSQL_TYPE_STRING:
+        case SW_MYSQL_TYPE_VAR_STRING:
+        case SW_MYSQL_TYPE_VARCHAR:
+        case SW_MYSQL_TYPE_NEWDATE:
+        /* Date Time */
+        case SW_MYSQL_TYPE_TIME:
+        case SW_MYSQL_TYPE_YEAR:
+        case SW_MYSQL_TYPE_TIMESTAMP:
+        case SW_MYSQL_TYPE_DATETIME:
+        case SW_MYSQL_TYPE_DATE:
+        case SW_MYSQL_TYPE_JSON:
+            sw_add_assoc_stringl(row_array, client->response.columns[i].name, buf + read_n, len, 1);
+            break;
+        /* Integer */
+        case SW_MYSQL_TYPE_TINY:
+        case SW_MYSQL_TYPE_SHORT:
+        case SW_MYSQL_TYPE_INT24:
+        case SW_MYSQL_TYPE_LONG:
+            if(client->connector.strict_type)
+            {
+                memcpy(value_buffer, buf + read_n, len);
+                value_buffer[len] = 0;
+                row.sint = strtol(value_buffer, &error, 10);
+                if (*error != '\0')
+                {
+                    return -SW_MYSQL_ERR_CONVLONG;
+                }
+                add_assoc_long(row_array, client->response.columns[i].name, row.sint);
+            }
+            else
+            {
+                sw_add_assoc_stringl(row_array, client->response.columns[i].name, buf + read_n, len, 1);
+
+            }
+            break;
+        case SW_MYSQL_TYPE_LONGLONG:
+            if(client->connector.strict_type) {
+                memcpy(value_buffer, buf + read_n, len);
+                value_buffer[len] = 0;
+                row.sbigint = strtoll(value_buffer, &error, 10);
+                if (*error != '\0') {
+                    return -SW_MYSQL_ERR_CONVLONG;
+                }
+                add_assoc_long(row_array, client->response.columns[i].name, row.sbigint);
+            }
+            else
+            {
+                sw_add_assoc_stringl(row_array, client->response.columns[i].name, buf + read_n, len, 1);
+
+            }
+            break;
+        case SW_MYSQL_TYPE_FLOAT:
+            if(client->connector.strict_type) {
+                memcpy(value_buffer, buf + read_n, len);
+                value_buffer[len] = 0;
+                row.mfloat = strtof(value_buffer, &error);
+                if (*error != '\0') {
+                    return -SW_MYSQL_ERR_CONVFLOAT;
+                }
+                add_assoc_double(row_array, client->response.columns[i].name, row.mfloat);
+            }
+            else
+            {
+                sw_add_assoc_stringl(row_array, client->response.columns[i].name, buf + read_n, len, 1);
+            }
+            break;
+
+        case SW_MYSQL_TYPE_DOUBLE:
+            if(client->connector.strict_type) {
+                memcpy(value_buffer, buf + read_n, len);
+                value_buffer[len] = 0;
+                row.mdouble = strtod(value_buffer, &error);
+                if (*error != '\0') {
+                    return -SW_MYSQL_ERR_CONVDOUBLE;
+                }
+                add_assoc_double(row_array, client->response.columns[i].name, row.mdouble);
+            }
+            else
+            {
+                sw_add_assoc_stringl(row_array, client->response.columns[i].name, buf + read_n, len, 1);
+
+            }
+            break;
+
+        default:
+            swWarn("unknown field type[%d].", type);
+            return -1;
+        }
+        read_n += len;
+    }
+
+    add_next_index_zval(result_array, row_array);
+
+#if PHP_MAJOR_VERSION > 5
+    if (row_array)
+    {
+        efree(row_array);
+    }
+#endif
+
+    return read_n;
+}
+
+#define DATETIME_MAX_SIZE  20
+
+static int mysql_decode_datetime(char *buf, char *result)
+{
+    uint16_t y = 0;
+    uint8_t M = 0, d = 0, h = 0, m = 0, s = 0, n;
+
+    n = *(uint8_t *) (buf);
+    if (n != 0)
+    {
+        y = *(uint16_t *) (buf + 1);
+        M = *(uint8_t *) (buf + 3);
+        d = *(uint8_t *) (buf + 4);
+        h = *(uint8_t *) (buf + 5);
+        m = *(uint8_t *) (buf + 6);
+        s = *(uint8_t *) (buf + 7);
+    }
+    snprintf(result, DATETIME_MAX_SIZE, "%04d-%02d-%02d %02d:%02d:%02d", y, M, d, h, m, s);
+
+    swTrace("n=%d\n", n);
+
+    return n;
+}
+
+static int mysql_decode_time(char *buf, char *result)
+{
+    uint8_t h = 0, m = 0, s = 0;
+
+    uint8_t n = *(uint8_t *) (buf);
+    if (n != 0)
+    {
+        h = *(uint8_t *) (buf + 6);
+        m = *(uint8_t *) (buf + 7);
+        s = *(uint8_t *) (buf + 8);
+    }
+
+    snprintf(result, DATETIME_MAX_SIZE, "%02d:%02d:%02d", h, m, s);
+
+    return n;
+}
+
+static int mysql_decode_date(char *buf, char *result)
+{
+    uint8_t M = 0, d = 0, n;
+    uint16_t y = 0;
+
+    n = *(uint8_t *) (buf);
+    if (n != 0)
+    {
+        y = *(uint16_t *) (buf + 1);
+        M = *(uint8_t *) (buf + 3);
+        d = *(uint8_t *) (buf + 4);
+    }
+    snprintf(result, DATETIME_MAX_SIZE, "%04d-%02d-%02d", y, M, d);
+    return n;
+}
+
+static void mysql_decode_year(char *buf, char *result)
+{
+    uint16_t y;
+    y = *(uint16_t *) (buf + 1);
+    snprintf(result, DATETIME_MAX_SIZE, "%04d", y);
+}
+
+static int mysql_decode_row_prepare(mysql_client *client, char *buf, int packet_len)
+{
+    int read_n = 0, i;
+    int tmp_len;
+    ulong_t len = 0;
+    char nul;
+
+    unsigned int null_count = ((client->response.num_column + 9) / 8) + 1;
+    buf += null_count;
+    packet_len -= null_count;
+
+    swTraceLog(SW_TRACE_MYSQL_CLIENT, "null_count=%d", null_count);
+
+    char datetime_buffer[DATETIME_MAX_SIZE];
+    mysql_row row;
+
+    zval *result_array = client->response.result_array;
+    zval *row_array = NULL;
+    SW_ALLOC_INIT_ZVAL(row_array);
+    array_init(row_array);
+
+    swTraceLog(SW_TRACE_MYSQL_CLIENT, "mysql_decode_row begin, num_column=%d, packet_len=%d.", client->response.num_column, packet_len);
+
+    for (i = 0; i < client->response.num_column; i++)
+    {
+        /* to check Null-Bitmap @see https://dev.mysql.com/doc/internals/en/null-bitmap.html */
+        if( ( (buf - null_count + 1)[((i+2)/8)] & (0x01 << ((i+2)%8)) ) != 0 ){
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "value: %s is null ,flag2", client->response.columns[i].name);
+            add_assoc_null(row_array, client->response.columns[i].name);
+            continue;
+        }
+
+        int type = client->response.columns[i].type;
+        swTraceLog(SW_TRACE_MYSQL_CLIENT, "value: name=%s, type=%d", client->response.columns[i].name, type);
+        switch (type)
+        {
+        /* Date Time */
+        case SW_MYSQL_TYPE_TIME:
+            len = mysql_decode_time(buf + read_n, datetime_buffer);
+            sw_add_assoc_stringl(row_array, client->response.columns[i].name, datetime_buffer, 8, 1);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%s", client->response.columns[i].name, datetime_buffer);
+            break;
+
+        case SW_MYSQL_TYPE_YEAR:
+            mysql_decode_year(buf + read_n, datetime_buffer);
+            sw_add_assoc_stringl(row_array, client->response.columns[i].name, datetime_buffer, 4, 1);
+            len = 3;
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%s", client->response.columns[i].name, datetime_buffer);
+            break;
+
+        case SW_MYSQL_TYPE_DATE:
+            len = mysql_decode_date(buf + read_n, datetime_buffer) + 1;
+            sw_add_assoc_stringl(row_array, client->response.columns[i].name, datetime_buffer, 10, 1);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%s", client->response.columns[i].name, datetime_buffer);
+            break;
+
+        case SW_MYSQL_TYPE_TIMESTAMP:
+        case SW_MYSQL_TYPE_DATETIME:
+            len = mysql_decode_datetime(buf + read_n, datetime_buffer) + 1;
+            sw_add_assoc_stringl(row_array, client->response.columns[i].name, datetime_buffer, 19, 1);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%s", client->response.columns[i].name, datetime_buffer);
+            break;
+
+        case SW_MYSQL_TYPE_NULL:
+            add_assoc_null(row_array, client->response.columns[i].name);
+            break;
+
+        /* String */
+        case SW_MYSQL_TYPE_TINY_BLOB:
+        case SW_MYSQL_TYPE_MEDIUM_BLOB:
+        case SW_MYSQL_TYPE_LONG_BLOB:
+        case SW_MYSQL_TYPE_BLOB:
+        case SW_MYSQL_TYPE_DECIMAL:
+        case SW_MYSQL_TYPE_NEWDECIMAL:
+        case SW_MYSQL_TYPE_BIT:
+        case SW_MYSQL_TYPE_JSON:
+        case SW_MYSQL_TYPE_STRING:
+        case SW_MYSQL_TYPE_VAR_STRING:
+        case SW_MYSQL_TYPE_VARCHAR:
+        case SW_MYSQL_TYPE_NEWDATE:
+            tmp_len = mysql_length_coded_binary(&buf[read_n], &len, &nul, packet_len - read_n);
+            if (tmp_len == -1)
+            {
+                return -SW_MYSQL_ERR_BAD_LCB;
+            }
+            read_n += tmp_len;
+            sw_add_assoc_stringl(row_array, client->response.columns[i].name, buf + read_n, len, 1);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%s", client->response.columns[i].name, swoole_strndup(buf + read_n, len));
+            break;
+
+        /* Integer */
+        case SW_MYSQL_TYPE_TINY:
+            row.stiny = *(int8_t *) (buf + read_n);
+            add_assoc_long(row_array, client->response.columns[i].name, row.stiny);
+            len = sizeof(row.stiny);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%d", client->response.columns[i].name, row.stiny);
+            break;
+
+        case SW_MYSQL_TYPE_SHORT:
+            row.ssmall = *(int16_t *) (buf + read_n);
+            add_assoc_long(row_array, client->response.columns[i].name, row.ssmall);
+            len = sizeof(row.ssmall);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%d", client->response.columns[i].name, row.ssmall);
+            break;
+
+        case SW_MYSQL_TYPE_INT24:
+        case SW_MYSQL_TYPE_LONG:
+            row.sint = *(int32_t *) (buf + read_n);
+            add_assoc_long(row_array, client->response.columns[i].name, row.sint);
+            len = sizeof(row.sint);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%d", client->response.columns[i].name, row.sint);
+            break;
+
+        case SW_MYSQL_TYPE_LONGLONG:
+            row.sbigint = *(int64_t *) (buf + read_n);
+            add_assoc_long(row_array, client->response.columns[i].name, row.sbigint);
+            len = sizeof(row.sbigint);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%ld", client->response.columns[i].name, row.sbigint);
+            break;
+
+        case SW_MYSQL_TYPE_FLOAT:
+            row.mfloat = *(float *) (buf + read_n);
+            add_assoc_double(row_array, client->response.columns[i].name, row.mfloat);
+            len = sizeof(row.mfloat);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%f", client->response.columns[i].name, row.mfloat);
+            break;
+
+        case SW_MYSQL_TYPE_DOUBLE:
+            row.mdouble = *(double *) (buf + read_n);
+            add_assoc_double(row_array, client->response.columns[i].name, row.mdouble);
+            len = sizeof(row.mdouble);
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "%s=%f", client->response.columns[i].name, row.mdouble);
+            break;
+
+        default:
+            swWarn("unknown field type[%d].", type);
+            return -1;
+        }
+        read_n += len;
+    }
+
+    add_next_index_zval(result_array, row_array);
+
+#if PHP_MAJOR_VERSION > 5
+    if (row_array)
+    {
+        efree(row_array);
+    }
+#endif
+
+    return read_n + null_count;
+}
+
+static sw_inline int mysql_read_eof(mysql_client *client, char *buffer, int n_buf)
+{
+    //EOF, length (3byte) + id(1byte) + 0xFE + warning(2byte) + status(2byte)
+    if (n_buf < 9)
+    {
+        client->response.wait_recv = 1;
+        return SW_ERR;
+    }
+
+    client->response.packet_length = mysql_uint3korr(buffer);
+    client->response.packet_number = buffer[3];
+
+    //not EOF packet
+    uint8_t eof = buffer[4];
+    if (eof != 0xfe)
+    {
+        return SW_ERR;
+    }
+
+    client->response.warnings = mysql_uint2korr(buffer + 5);
+    client->response.status_code = mysql_uint2korr(buffer + 7);
+
+    return SW_OK;
+}
+
+static sw_inline int mysql_read_params(mysql_client *client)
+{
+    while (1)
+    {
+        char *buffer = client->buffer->str + client->buffer->offset;
+        uint32_t n_buf = client->buffer->length - client->buffer->offset;
+
+        swTraceLog(SW_TRACE_MYSQL_CLIENT, "n_buf=%d, length=%d.", n_buf, client->response.packet_length);
+
+        if (n_buf < 4)
+        {
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "read eof 23.");
+            return SW_ERR;
+        }
+
+        if (client->statement->unreaded_param_count > 0)
+        {
+            //no enough data
+            if (n_buf - 4 < client->response.packet_length)
+            {
+                swTraceLog(SW_TRACE_MYSQL_CLIENT, "read eof 234234.");
+                return SW_ERR;
+            }
+            // Read and ignore parameter field. Sentence from MySQL source:
+            // skip parameters data: we don't support it yet
+            client->response.packet_length = mysql_uint3korr(buffer);
+            client->response.packet_number = buffer[3];
+            client->buffer->offset += (client->response.packet_length + 4);
+            client->statement->unreaded_param_count--;
+
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "read param, count=%d.", client->statement->unreaded_param_count);
+
+            continue;
+        }
+        else
+        {
+            swTraceLog(SW_TRACE_MYSQL_CLIENT, "read eof.");
+
+            if (mysql_read_eof(client, buffer, n_buf) == 0)
+            {
+                client->buffer->offset += 9;
+                return SW_OK;
+            }
+            else
+            {
+                return SW_ERR;
+            }
+        }
+    }
+}
+
+static sw_inline int mysql_read_rows(mysql_client *client)
+{
+    char *buffer = client->buffer->str + client->buffer->offset;
+    uint32_t n_buf = client->buffer->length - client->buffer->offset;
+    int ret;
+
+    swTraceLog(SW_TRACE_MYSQL_CLIENT, "n_buf=%d", n_buf);
+
+    //RecordSet parse
+    while (n_buf > 0)
+    {
+        if (n_buf < 4)
+        {
+            client->response.wait_recv = 1;
+            return SW_ERR;
+        }
+        //RecordSet end
+        else if (n_buf == 9 && mysql_read_eof(client, buffer, n_buf) == 0)
+        {
+            if (client->response.columns)
+            {
+                mysql_columns_free(client);
+            }
+            return SW_OK;
+        }
+
+        client->response.packet_length = mysql_uint3korr(buffer);
+        client->response.packet_number = buffer[3];
+        buffer += 4;
+        n_buf -= 4;
+
+        swTraceLog(SW_TRACE_MYSQL_CLIENT, "record size=%d", client->response.packet_length);
+
+        //no enough data
+        if (n_buf < client->response.packet_length)
+        {
+            client->response.wait_recv = 1;
+            return SW_ERR;
+        }
+
+        if (client->cmd == SW_MYSQL_COM_STMT_EXECUTE)
+        {
+            ret = mysql_decode_row_prepare(client, buffer, client->response.packet_length);
+        }
+        else
+        {
+            //decode
+            ret = mysql_decode_row(client, buffer, client->response.packet_length);
+        }
+
+        if (ret < 0)
+        {
+            break;
+        }
+
+        //next row
+        client->response.num_row++;
+        buffer += client->response.packet_length;
+        n_buf -= client->response.packet_length;
+        client->buffer->offset += client->response.packet_length + 4;
+    }
+
+    return SW_ERR;
+}
+
+static int mysql_decode_field(char *buf, int len, mysql_field *col)
+{
+    int i;
+    ulong_t size;
+    char nul;
+    char *wh;
+    int tmp_len;
+
+    /**
+     * string buffer
+     */
+    char *_buffer = (char*) emalloc(len);
+    if (!_buffer)
+    {
+        return -SW_MYSQL_ERR_BAD_LCB;
+    }
+    col->buffer = _buffer;
+
+    wh = buf;
+
+    i = 0;
+
+    tmp_len = mysql_length_coded_binary(&buf[i], &size, &nul, len - i);
+    if (tmp_len == -1)
+    {
+        return -SW_MYSQL_ERR_BAD_LCB;
+    }
+    i += tmp_len;
+    if (i + size > len)
+    {
+        return -SW_MYSQL_ERR_LEN_OVER_BUFFER;
+    }
+    col->catalog_length = size;
+    col->catalog = _buffer;
+    _buffer += (size + 1);
+    memcpy(col->catalog, &buf[i], size);
+    col->catalog[size] = '\0';
+    wh += size + 1;
+    i += size;
+
+    /* n (Length Coded String)    db */
+    tmp_len = mysql_length_coded_binary(&buf[i], &size, &nul, len - i);
+    if (tmp_len == -1)
+    {
+        return -SW_MYSQL_ERR_BAD_LCB;
+    }
+    i += tmp_len;
+    if (i + size > len)
+    {
+        return -SW_MYSQL_ERR_LEN_OVER_BUFFER;
+    }
+    col->db_length = size;
+    col->db = _buffer;
+    _buffer += (size + 1);
+    memcpy(col->db, &buf[i], size);
+    col->db[size] = '\0';
+    wh += size + 1;
+    i += size;
+
+    /* n (Length Coded String)    table */
+    tmp_len = mysql_length_coded_binary(&buf[i], &size, &nul, len - i);
+    if (tmp_len == -1)
+    {
+        return -SW_MYSQL_ERR_BAD_LCB;
+    }
+    i += tmp_len;
+    if (i + size > len)
+    {
+        return -SW_MYSQL_ERR_LEN_OVER_BUFFER;
+    }
+    col->table_length = size;
+    col->table = _buffer;
+    _buffer += (size + 1);
+    memcpy(col->table, &buf[i], size);
+    col->table[size] = '\0';
+    wh += size + 1;
+    i += size;
+
+    /* n (Length Coded String)    org_table */
+    tmp_len = mysql_length_coded_binary(&buf[i], &size, &nul, len - i);
+    if (tmp_len == -1)
+    {
+        return -SW_MYSQL_ERR_BAD_LCB;
+    }
+    i += tmp_len;
+    if (i + size > len)
+    {
+        return -SW_MYSQL_ERR_LEN_OVER_BUFFER;
+    }
+    col->org_table_length = size;
+    col->org_table = _buffer;
+    _buffer += (size + 1);
+    memcpy(col->org_table, &buf[i], size);
+    col->org_table[size] = '\0';
+    wh += size + 1;
+    i += size;
+
+    /* n (Length Coded String)    name */
+    tmp_len = mysql_length_coded_binary(&buf[i], &size, &nul, len - i);
+    if (tmp_len == -1)
+    {
+        return -SW_MYSQL_ERR_BAD_LCB;
+    }
+    i += tmp_len;
+    if (i + size > len)
+    {
+        return -SW_MYSQL_ERR_LEN_OVER_BUFFER;
+    }
+    col->name_length = size;
+    col->name = _buffer;
+    _buffer += (size + 1);
+    memcpy(col->name, &buf[i], size);
+    col->name[size] = '\0';
+    wh += size + 1;
+    i += size;
+
+    /* n (Length Coded String)    org_name */
+    tmp_len = mysql_length_coded_binary(&buf[i], &size, &nul, len - i);
+    if (tmp_len == -1)
+    {
+        return -SW_MYSQL_ERR_BAD_LCB;
+    }
+    i += tmp_len;
+    if (i + size > len)
+    {
+        return -SW_MYSQL_ERR_LEN_OVER_BUFFER;
+    }
+    col->org_name_length = size;
+    col->org_name = _buffer;
+    _buffer += (size + 1);
+    memcpy(col->org_name, &buf[i], size);
+    col->org_name[size] = '\0';
+    wh += size + 1;
+    i += size;
+
+    /* check len */
+    if (i + 13 > len)
+    {
+        return -SW_MYSQL_ERR_LEN_OVER_BUFFER;
+    }
+
+    /* (filler) */
+    i += 1;
+
+    /* charset */
+    col->charsetnr = mysql_uint2korr(&buf[i]);
+    i += 2;
+
+    /* length */
+    col->length = mysql_uint4korr(&buf[i]);
+    i += 4;
+
+    /* type */
+    col->type = (enum mysql_field_types) (uchar)buf[i];
+    i += 1;
+
+    /* flags */
+    col->flags = mysql_uint2korr(&buf[i]);
+    i += 2;
+
+    /* decimals */
+    col->decimals = buf[i];
+    i += 1;
+
+    /* filler */
+    i += 2;
+
+    /* default - a priori facultatif */
+    if (len - i > 0)
+    {
+        tmp_len = mysql_length_coded_binary(&buf[i], &size, &nul, len - i);
+        if (tmp_len == -1)
+        {
+            return -SW_MYSQL_ERR_BAD_LCB;
+        }
+        i += tmp_len;
+        if (i + size > len)
+        {
+            return -SW_MYSQL_ERR_LEN_OVER_BUFFER;
+        }
+        col->def_length = size;
+        col->def = _buffer;
+        //_buffer += (size + 1);
+        memcpy(col->def, &buf[i], size);
+        col->def[size] = '\0';
+        wh += size + 1;
+        i += size;
+    }
+    else
+    {
+        col->def = NULL;
+        col->def_length = 0;
+    }
+
+    /* set write pointer */
+    return wh - buf;
+}
+
+static int mysql_read_columns(mysql_client *client)
+{
+    char *buffer = client->buffer->str + client->buffer->offset;
+    uint32_t n_buf = client->buffer->length - client->buffer->offset;
+    int ret;
+
+    for (; client->response.index_column < client->response.num_column; client->response.index_column++)
+    {
+        swTraceLog(SW_TRACE_MYSQL_CLIENT, "index_index_column=%d, n_buf=%d.", client->response.index_column, n_buf);
+
+        if (n_buf < 4)
+        {
+            return SW_ERR;
+        }
+
+        client->response.packet_length = mysql_uint3korr(buffer);
+
+        //no enough data
+        if (n_buf - 4 < client->response.packet_length)
+        {
+            return SW_ERR;
+        }
+
+        client->response.packet_number = buffer[3];
+        buffer += 4;
+        n_buf -= 4;
+
+        ret = mysql_decode_field(buffer, client->response.packet_length, &client->response.columns[client->response.index_column]);
+        if (ret > 0)
+        {
+            buffer += client->response.packet_length;
+            n_buf -= client->response.packet_length;
+            client->buffer->offset += (client->response.packet_length + 4);
+        }
+        else
+        {
+            swWarn("mysql_decode_field failed, code=%d.", ret);
+            break;
+        }
+    }
+
+    if (mysql_read_eof(client, buffer, n_buf) < 0)
+    {
+        return SW_ERR;
+    }
+
+    buffer += 9;
+    n_buf -= 9;
+
+    if (client->cmd != SW_MYSQL_COM_STMT_PREPARE)
+    {
+        zval *result_array = client->response.result_array;
+        if (!result_array)
+        {
+            SW_ALLOC_INIT_ZVAL(result_array);
+            array_init(result_array);
+            client->response.result_array = result_array;
+        }
+    }
+
+    client->buffer->offset += buffer - (client->buffer->str + client->buffer->offset);
+
+    return SW_OK;
+}
+
+
+int mysql_response(mysql_client *client)
 {
     swString *buffer = client->buffer;
 
@@ -539,6 +1473,8 @@ static int mysql_response(mysql_client *client)
 
     while (n_buf > 0)
     {
+        swTraceLog(SW_TRACE_MYSQL_CLIENT, "client->state=%d, n_buf=%d.", client->state, n_buf);
+
         switch (client->state)
         {
         case SW_MYSQL_STATE_READ_START:
@@ -592,13 +1528,31 @@ static int mysql_response(mysql_client *client)
             /* ok */
             else if (client->response.response_type == 0)
             {
+                if (client->cmd == SW_MYSQL_COM_STMT_PREPARE)
+                {
+                    ret = mysql_parse_prepare_result(client, p, n_buf);
+                    if (ret < 0)
+                    {
+                        return SW_ERR;
+                    }
+                    else
+                    {
+                        p += ret;
+                        n_buf -= ret;
+                        buffer->offset += (5 + ret);
+                        client->response.num_column = client->statement->field_count;
+                        client->response.columns = ecalloc(client->response.num_column, sizeof(mysql_field));
+                        client->state = SW_MYSQL_STATE_READ_PARAM;
+                        break;
+                    }
+                }
                 /* affected rows */
-                ret = mysql_length_coded_binary(p, (ulong_t *) &client->response.affected_rows, &nul, n_buf);
+                ret = mysql_length_coded_binary(p, &client->response.affected_rows, &nul, n_buf);
                 n_buf -= ret;
                 p += ret;
 
                 /* insert id */
-                ret = mysql_length_coded_binary(p, (ulong_t *) &client->response.insert_id, &nul, n_buf);
+                ret = mysql_length_coded_binary(p, &client->response.insert_id, &nul, n_buf);
                 n_buf -= ret;
                 p += ret;
 
@@ -617,7 +1571,7 @@ static int mysql_response(mysql_client *client)
             else
             {
                 //Protocol::LengthEncodedInteger
-                ret = mysql_length_coded_binary(p - 1, (ulong_t *) &client->response.num_column, &nul, n_buf + 1);
+                ret = mysql_length_coded_binary(p - 1, &client->response.num_column, &nul, n_buf + 1);
                 if (ret < 0)
                 {
                     return SW_ERR;
@@ -635,6 +1589,11 @@ static int mysql_response(mysql_client *client)
             }
             else
             {
+                if (client->cmd == SW_MYSQL_COM_STMT_PREPARE)
+                {
+                    mysql_columns_free(client);
+                    return SW_OK;
+                }
                 client->state = SW_MYSQL_STATE_READ_ROW;
                 break;
             }
@@ -650,6 +1609,22 @@ static int mysql_response(mysql_client *client)
                 return SW_OK;
             }
 
+        case SW_MYSQL_STATE_READ_PARAM:
+            if (mysql_read_params(client) < 0)
+            {
+                return SW_ERR;
+            }
+            else if (client->statement->field_count > 0)
+            {
+                client->state = SW_MYSQL_STATE_READ_FIELD;
+                continue;
+            }
+            else
+            {
+                mysql_columns_free(client);
+                return SW_OK;
+            }
+
         default:
             return SW_ERR;
         }
@@ -658,9 +1633,59 @@ static int mysql_response(mysql_client *client)
     return SW_OK;
 }
 
+int mysql_query(zval *zobject, mysql_client *client, swString *sql, zval *callback TSRMLS_DC)
+{
+    if (!client->cli)
+    {
+        swoole_php_fatal_error(E_WARNING, "mysql connection#%d is closed.", client->fd);
+        return SW_ERR;
+    }
+    if (!client->connected)
+    {
+        swoole_php_error(E_WARNING, "mysql client is not connected to server.");
+        return SW_ERR;
+    }
+    if (client->state != SW_MYSQL_STATE_QUERY)
+    {
+        swoole_php_fatal_error(E_WARNING, "mysql client is waiting response, cannot send new sql query.");
+        return SW_ERR;
+    }
+
+    if (callback != NULL)
+    {
+        sw_zval_add_ref(&callback);
+        client->callback = sw_zval_dup(callback);
+    }
+
+    client->cmd = SW_MYSQL_COM_QUERY;
+
+    swString_clear(mysql_request_buffer);
+
+    if (mysql_request(sql, mysql_request_buffer) < 0)
+    {
+        return SW_ERR;
+    }
+    //send query
+    if (SwooleG.main_reactor->write(SwooleG.main_reactor, client->fd, mysql_request_buffer->str, mysql_request_buffer->length) < 0)
+    {
+        //connection is closed
+        if (swConnection_error(errno) == SW_CLOSE)
+        {
+            zend_update_property_bool(swoole_mysql_class_entry_ptr, zobject, ZEND_STRL("connected"), 0 TSRMLS_CC);
+            zend_update_property_long(swoole_mysql_class_entry_ptr, zobject, ZEND_STRL("errno"), 2006 TSRMLS_CC);
+        }
+        return SW_ERR;
+    }
+    else
+    {
+        client->state = SW_MYSQL_STATE_READ_START;
+        return SW_OK;
+    }
+}
+
 #ifdef SW_MYSQL_DEBUG
 
-static void mysql_client_info(mysql_client *client)
+void mysql_client_info(mysql_client *client)
 {
     printf("\n"SW_START_LINE"\nmysql_client\nbuffer->offset=%ld\nbuffer->length=%ld\nstatus=%d\n"
             "packet_length=%d\npacket_number=%d\n"
@@ -680,7 +1705,7 @@ static void mysql_client_info(mysql_client *client)
     }
 }
 
-static void mysql_column_info(mysql_field *field)
+void mysql_column_info(mysql_field *field)
 {
     printf("\n"SW_START_LINE"\nname=%s, table=%s, db=%s\n"
             "name_length=%d, table_length=%d, db_length=%d\n"
@@ -723,10 +1748,18 @@ static PHP_METHOD(swoole_mysql, connect)
         RETURN_FALSE;
     }
 
+    mysql_client *client = swoole_get_object(getThis());
+    if (client->cli)
+    {
+        swoole_php_error(E_WARNING, "The mysql client is already connected server.");
+        RETURN_FALSE;
+    }
+
+    php_swoole_array_separate(server_info);
+
     HashTable *_ht = Z_ARRVAL_P(server_info);
     zval *value;
 
-    mysql_client *client = swoole_get_object(getThis());
     mysql_connector *connector = &client->connector;
 
     if (php_swoole_array_get_value(_ht, "host", value))
@@ -802,9 +1835,26 @@ static PHP_METHOD(swoole_mysql, connect)
             RETURN_FALSE;
         }
     }
+    //use the server default charset.
     else
     {
-        connector->character_set = SW_MYSQL_DEFAULT_CHARSET;
+        connector->character_set = 0;
+    }
+
+    if (php_swoole_array_get_value(_ht, "strict_type", value))
+    {
+#if PHP_MAJOR_VERSION < 7
+        if(Z_TYPE_P(value) == IS_BOOL && Z_BVAL_P(value) == 1)
+#else
+        if(Z_TYPE_P(value) == IS_TRUE)
+#endif
+        {
+            connector->strict_type = 1;
+        }else{
+            connector->strict_type = 0;
+        }
+    } else{
+        connector->strict_type = 0;
     }
 
     swClient *cli = emalloc(sizeof(swClient));
@@ -822,28 +1872,37 @@ static PHP_METHOD(swoole_mysql, connect)
     }
 
     php_swoole_check_reactor();
-    if (!isset_event_callback)
+    if (!swReactor_handle_isset(SwooleG.main_reactor, PHP_SWOOLE_FD_MYSQL))
     {
         SwooleG.main_reactor->setHandle(SwooleG.main_reactor, PHP_SWOOLE_FD_MYSQL | SW_EVENT_READ, swoole_mysql_onRead);
         SwooleG.main_reactor->setHandle(SwooleG.main_reactor, PHP_SWOOLE_FD_MYSQL | SW_EVENT_WRITE, swoole_mysql_onWrite);
         SwooleG.main_reactor->setHandle(SwooleG.main_reactor, PHP_SWOOLE_FD_MYSQL | SW_EVENT_ERROR, swoole_mysql_onError);
     }
-
+    //create socket
     if (swClient_create(cli, type, 0) < 0)
     {
         zend_throw_exception(swoole_mysql_exception_class_entry_ptr, "swClient_create failed.", 1 TSRMLS_CC);
         RETURN_FALSE;
     }
-
-    int tcp_nodelay = 1;
-    if (setsockopt(cli->socket->fd, IPPROTO_TCP, TCP_NODELAY, (const void *) &tcp_nodelay, sizeof(int)) == -1)
+    //tcp nodelay
+    if (type != SW_SOCK_UNIX_STREAM)
     {
-        swoole_php_sys_error(E_WARNING, "setsockopt(%d, IPPROTO_TCP, TCP_NODELAY) failed.", cli->socket->fd);
+        int tcp_nodelay = 1;
+        if (setsockopt(cli->socket->fd, IPPROTO_TCP, TCP_NODELAY, (const void *) &tcp_nodelay, sizeof(int)) == -1)
+        {
+            swoole_php_sys_error(E_WARNING, "setsockopt(%d, IPPROTO_TCP, TCP_NODELAY) failed.", cli->socket->fd);
+        }
     }
-
+    //connect to mysql server
     int ret = cli->connect(cli, connector->host, connector->port, connector->timeout, 1);
     if ((ret < 0 && errno == EINPROGRESS) || ret == 0)
     {
+        if (connector->timeout > 0)
+        {
+            php_swoole_check_timer((int) (connector->timeout * 1000));
+            cli->timer = SwooleG.timer.add(&SwooleG.timer, (int) (connector->timeout * 1000), 0, client, swoole_mysql_onTimeout);
+            cli->timeout = connector->timeout;
+        }
         if (SwooleG.main_reactor->add(SwooleG.main_reactor, cli->socket->fd, PHP_SWOOLE_FD_MYSQL | SW_EVENT_WRITE) < 0)
         {
             RETURN_FALSE;
@@ -866,6 +1925,7 @@ static PHP_METHOD(swoole_mysql, connect)
     client->cli = cli;
     sw_copy_to_stack(client->object, client->_object);
     sw_zval_add_ref(&client->object);
+    sw_zval_ptr_dtor(&server_info);
 
     swConnection *_socket = swReactor_get(SwooleG.main_reactor, cli->socket->fd);
     _socket->object = client;
@@ -885,6 +1945,11 @@ static PHP_METHOD(swoole_mysql, query)
         return;
     }
 
+    if (!php_swoole_is_callable(callback TSRMLS_CC))
+    {
+        RETURN_FALSE;
+    }
+
     if (sql.length <= 0)
     {
         swoole_php_fatal_error(E_WARNING, "Query is empty.");
@@ -898,41 +1963,123 @@ static PHP_METHOD(swoole_mysql, query)
         RETURN_FALSE;
     }
 
-    if (!client->cli)
+    SW_CHECK_RETURN(mysql_query(getThis(), client, &sql, callback TSRMLS_CC));
+}
+
+static PHP_METHOD(swoole_mysql, begin)
+{
+    zval *callback;
+    if (zend_parse_parameters(ZEND_NUM_ARGS()TSRMLS_CC, "z", &callback) == FAILURE)
     {
-        swoole_php_fatal_error(E_WARNING, "mysql connection#%d is closed.", client->fd);
+        return;
+    }
+
+    if (!php_swoole_is_callable(callback TSRMLS_CC))
+    {
         RETURN_FALSE;
     }
 
-    if (client->state != SW_MYSQL_STATE_QUERY)
+    mysql_client *client = swoole_get_object(getThis());
+    if (!client)
     {
-        swoole_php_fatal_error(E_WARNING, "mysql client is waiting response, cannot send new sql query.");
+        swoole_php_fatal_error(E_WARNING, "object is not instanceof swoole_mysql.");
+        RETURN_FALSE;
+    }
+    if (client->transaction)
+    {
+        zend_throw_exception(swoole_mysql_exception_class_entry_ptr, "There is already an active transaction.", 21 TSRMLS_CC);
         RETURN_FALSE;
     }
 
-    sw_zval_add_ref(&callback);
-    client->callback = sw_zval_dup(callback);
-
-    swString_clear(mysql_request_buffer);
-
-    if (mysql_request(&sql, mysql_request_buffer) < 0)
+    swString sql;
+    bzero(&sql, sizeof(sql));
+    swString_append_ptr(&sql, ZEND_STRL("START TRANSACTION"));
+    if (mysql_query(getThis(), client, &sql, callback TSRMLS_CC) < 0)
     {
-        RETURN_FALSE;
-    }
-    //send query
-    if (SwooleG.main_reactor->write(SwooleG.main_reactor, client->fd, mysql_request_buffer->str, mysql_request_buffer->length) < 0)
-    {
-        //connection is closed
-        if (swConnection_error(errno) == SW_CLOSE)
-        {
-            zend_update_property_bool(swoole_mysql_class_entry_ptr, getThis(), ZEND_STRL("connected"), 0 TSRMLS_CC);
-            zend_update_property_bool(swoole_mysql_class_entry_ptr, getThis(), ZEND_STRL("errno"), 2006 TSRMLS_CC);
-        }
         RETURN_FALSE;
     }
     else
     {
-        client->state = SW_MYSQL_STATE_READ_START;
+        client->transaction = 1;
+        RETURN_TRUE;
+    }
+}
+
+static PHP_METHOD(swoole_mysql, commit)
+{
+    zval *callback;
+    if (zend_parse_parameters(ZEND_NUM_ARGS()TSRMLS_CC, "z", &callback) == FAILURE)
+    {
+        return;
+    }
+
+    if (!php_swoole_is_callable(callback TSRMLS_CC))
+    {
+        RETURN_FALSE;
+    }
+
+    mysql_client *client = swoole_get_object(getThis());
+    if (!client)
+    {
+        swoole_php_fatal_error(E_WARNING, "object is not instanceof swoole_mysql.");
+        RETURN_FALSE;
+    }
+    if (!client->transaction)
+    {
+        zend_throw_exception(swoole_mysql_exception_class_entry_ptr, "There is no active transaction.", 22 TSRMLS_CC);
+        RETURN_FALSE;
+    }
+
+    swString sql;
+    bzero(&sql, sizeof(sql));
+    swString_append_ptr(&sql, ZEND_STRL("COMMIT"));
+    if (mysql_query(getThis(), client, &sql, callback TSRMLS_CC) < 0)
+    {
+        RETURN_FALSE;
+    }
+    else
+    {
+        client->transaction = 0;
+        RETURN_TRUE;
+    }
+}
+
+static PHP_METHOD(swoole_mysql, rollback)
+{
+    zval *callback;
+    if (zend_parse_parameters(ZEND_NUM_ARGS()TSRMLS_CC, "z", &callback) == FAILURE)
+    {
+        return;
+    }
+
+    if (!php_swoole_is_callable(callback TSRMLS_CC))
+    {
+        RETURN_FALSE;
+    }
+
+
+    mysql_client *client = swoole_get_object(getThis());
+    if (!client)
+    {
+        swoole_php_fatal_error(E_WARNING, "object is not instanceof swoole_mysql.");
+        RETURN_FALSE;
+    }
+    if (!client->transaction)
+    {
+        zend_throw_exception(swoole_mysql_exception_class_entry_ptr, "There is no active transaction.", 22 TSRMLS_CC);
+        RETURN_FALSE;
+    }
+
+    swString sql;
+    bzero(&sql, sizeof(sql));
+    swString_append_ptr(&sql, ZEND_STRL("ROLLBACK"));
+    if (mysql_query(getThis(), client, &sql, callback TSRMLS_CC) < 0)
+    {
+        RETURN_FALSE;
+    }
+    else
+    {
+        client->transaction = 0;
         RETURN_TRUE;
     }
 }
@@ -975,7 +2122,12 @@ static PHP_METHOD(swoole_mysql, close)
 
     if (!client->cli)
     {
-        swoole_php_fatal_error(E_WARNING, "mysql connection#%d is closed.", client->fd);
+        RETURN_FALSE;
+    }
+
+    if (client->cli->socket->closing)
+    {
+        swoole_error_log(SW_LOG_NOTICE, SW_ERROR_SESSION_CLOSING, "The mysql connection[%d] is closing.", client->fd);
         RETURN_FALSE;
     }
 
@@ -983,7 +2135,8 @@ static PHP_METHOD(swoole_mysql, close)
     SwooleG.main_reactor->del(SwooleG.main_reactor, client->fd);
 
     swConnection *socket = swReactor_get(SwooleG.main_reactor, client->fd);
-    socket->object = NULL;
+    bzero(socket, sizeof(swConnection));
+    socket->removed = 1;
 
     zend_bool is_destroyed = client->cli->destroyed;
 
@@ -992,10 +2145,15 @@ static PHP_METHOD(swoole_mysql, close)
     zval *object = getThis();
     if (client->onClose)
     {
+        client->cli->socket->closing = 1;
         args[0] = &object;
         if (sw_call_user_function_ex(EG(function_table), NULL, client->onClose, &retval, 1, args, 0, NULL TSRMLS_CC) != SUCCESS)
         {
             swoole_php_fatal_error(E_WARNING, "swoole_mysql onClose callback error.");
+        }
+        if (EG(exception))
+        {
+            zend_exception_error(EG(exception), E_ERROR TSRMLS_CC);
         }
         if (retval)
         {
@@ -1041,10 +2199,33 @@ static PHP_METHOD(swoole_mysql, on)
     RETURN_TRUE;
 }
 
+static PHP_METHOD(swoole_mysql, getState)
+{
+    mysql_client *client = swoole_get_object(getThis());
+    if (!client)
+    {
+        swoole_php_fatal_error(E_WARNING, "object is not instanceof swoole_mysql.");
+        RETURN_FALSE;
+    }
+    RETURN_LONG(client->state);
+}
+
+static void swoole_mysql_onTimeout(swTimer *timer, swTimer_node *tnode)
+{
+#if PHP_MAJOR_VERSION < 7
+    TSRMLS_FETCH_FROM_CTX(sw_thread_ctx ? sw_thread_ctx : NULL);
+#endif
+    mysql_client *client = tnode->data;
+    client->connector.error_code = ETIMEDOUT;
+    client->connector.error_msg = strerror(client->connector.error_code);
+    client->connector.error_length = strlen(client->connector.error_msg);
+    swoole_mysql_onConnect(client TSRMLS_CC);
+}
+
 static int swoole_mysql_onError(swReactor *reactor, swEvent *event)
 {
     swClient *cli = event->socket->object;
-    if (cli->socket->active)
+    if (cli && cli->socket && cli->socket->active)
     {
 #if PHP_MAJOR_VERSION < 7
         TSRMLS_FETCH_FROM_CTX(sw_thread_ctx ? sw_thread_ctx : NULL);
@@ -1075,23 +2256,29 @@ static void swoole_mysql_onConnect(mysql_client *client TSRMLS_DC)
     zval *zobject = client->object;
     zval *callback = sw_zend_read_property(swoole_mysql_class_entry_ptr, zobject, ZEND_STRL("onConnect"), 0 TSRMLS_CC);
 
-    zval *retval;
+    zval *retval = NULL;
     zval *result;
     zval **args[2];
 
     SW_MAKE_STD_ZVAL(result);
 
+    if (client->cli->timer)
+    {
+        swTimer_del(&SwooleG.timer, client->cli->timer);
+        client->cli->timer = NULL;
+    }
+
     if (client->connector.error_code > 0)
     {
         zend_update_property_stringl(swoole_mysql_class_entry_ptr, zobject, ZEND_STRL("connect_error"), client->connector.error_msg, client->connector.error_length TSRMLS_CC);
         zend_update_property_long(swoole_mysql_class_entry_ptr, zobject, ZEND_STRL("connect_errno"), client->connector.error_code TSRMLS_CC);
-
         ZVAL_BOOL(result, 0);
     }
     else
     {
         zend_update_property_bool(swoole_mysql_class_entry_ptr, zobject, ZEND_STRL("connected"), 1 TSRMLS_CC);
         ZVAL_BOOL(result, 1);
+        client->connected = 1;
     }
 
     args[0] = &zobject;
@@ -1110,6 +2297,16 @@ static void swoole_mysql_onConnect(mysql_client *client TSRMLS_DC)
         sw_zval_ptr_dtor(&retval);
     }
     sw_zval_ptr_dtor(&result);
+    if (client->connector.error_code > 0)
+    {
+        retval = NULL;
+        //close
+        sw_zend_call_method_with_0_params(&zobject, swoole_mysql_class_entry_ptr, NULL, "close", &retval);
+        if (retval)
+        {
+            sw_zval_ptr_dtor(&retval);
+        }
+    }
 }
 
 static int swoole_mysql_onWrite(swReactor *reactor, swEvent *event)
@@ -1145,7 +2342,6 @@ static int swoole_mysql_onWrite(swReactor *reactor, swEvent *event)
         client->connector.error_code = SwooleG.error;
         client->connector.error_msg = strerror(SwooleG.error);
         client->connector.error_length = strlen(client->connector.error_msg);
-        mysql_client_free(client, client->object);
         swoole_mysql_onConnect(client TSRMLS_CC);
     }
     return SW_OK;
@@ -1339,6 +2535,10 @@ static int swoole_mysql_onRead(swReactor *reactor, swEvent *event)
                 swoole_php_fatal_error(E_WARNING, "swoole_async_mysql callback[2] handler error.");
                 reactor->del(SwooleG.main_reactor, event->fd);
             }
+            if (EG(exception))
+            {
+                zend_exception_error(EG(exception), E_ERROR TSRMLS_CC);
+            }
             /* free memory */
             if (retval)
             {
@@ -1363,3 +2563,55 @@ static int swoole_mysql_onRead(swReactor *reactor, swEvent *event)
     return SW_OK;
 }
 
+#ifdef SW_USE_MYSQLND
+static PHP_METHOD(swoole_mysql, escape)
+{
+    swString str;
+    bzero(&str, sizeof(str));
+    long flags;
+
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|l", &str.str, &str.length, &flags) == FAILURE)
+    {
+        return;
+    }
+
+    if (str.length <= 0)
+    {
+        swoole_php_fatal_error(E_WARNING, "String is empty.");
+        RETURN_FALSE;
+    }
+
+    mysql_client *client = swoole_get_object(getThis());
+    if (!client)
+    {
+        swoole_php_fatal_error(E_WARNING, "object is not instanceof swoole_mysql.");
+        RETURN_FALSE;
+    }
+    if (!client->cli)
+    {
+        swoole_php_fatal_error(E_WARNING, "mysql connection#%d is closed.", client->fd);
+        RETURN_FALSE;
+    }
+
+    char *newstr = safe_emalloc(2, str.length + 1, 1);
+    if (newstr == NULL)
+    {
+        swoole_php_fatal_error(E_ERROR, "emalloc(%ld) failed.", str.length + 1);
+        RETURN_FALSE;
+    }
+
+    const MYSQLND_CHARSET* cset = mysqlnd_find_charset_nr(client->connector.character_set);
+    if (cset == NULL)
+    {
+        swoole_php_fatal_error(E_ERROR, "unknown mysql charset[%s].", client->connector.character_set);
+        RETURN_FALSE;
+    }
+    int newstr_len = mysqlnd_cset_escape_slashes(cset, newstr, str.str, str.length TSRMLS_CC);
+    if (newstr_len < 0)
+    {
+        swoole_php_fatal_error(E_ERROR, "mysqlnd_cset_escape_slashes() failed.");
+        RETURN_FALSE;
+    }
+    SW_RETURN_STRINGL(newstr, newstr_len, 0);
+}
+#endif

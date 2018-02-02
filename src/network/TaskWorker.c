@@ -31,19 +31,9 @@ void swTaskWorker_init(swProcessPool *pool)
     pool->start_id = SwooleG.serv->worker_num;
     pool->run_worker_num = SwooleG.task_worker_num;
 
-    char *tmp_dir = swoole_dirname(SwooleG.task_tmpdir);
-    //create tmp dir
-    if (access(tmp_dir, R_OK) < 0 && swoole_mkdir_recursive(tmp_dir) < 0)
-    {
-        swWarn("create task tmp dir failed.");
-    }
     if (SwooleG.task_ipc_mode == SW_TASK_IPC_PREEMPTIVE)
     {
         pool->dispatch_mode = SW_DISPATCH_QUEUE;
-    }
-    if (tmp_dir)
-    {
-        sw_strdup_free(tmp_dir);
     }
 }
 
@@ -117,10 +107,13 @@ static void swTaskWorker_signal_init(void)
 {
     swSignal_set(SIGHUP, NULL, 1, 0);
     swSignal_set(SIGPIPE, NULL, 1, 0);
-    swSignal_set(SIGUSR1, NULL, 1, 0);
+    swSignal_set(SIGUSR1, swWorker_signal_handler, 1, 0);
     swSignal_set(SIGUSR2, NULL, 1, 0);
     swSignal_set(SIGTERM, swWorker_signal_handler, 1, 0);
     swSignal_set(SIGALRM, swSystemTimer_signal_handler, 1, 0);
+#ifdef SIGRTMIN
+    swSignal_set(SIGRTMIN, swWorker_signal_handler, 1, 0);
+#endif
 }
 
 void swTaskWorker_onStart(swProcessPool *pool, int worker_id)
@@ -132,11 +125,17 @@ void swTaskWorker_onStart(swProcessPool *pool, int worker_id)
     SwooleG.use_timer_pipe = 0;
     SwooleG.use_timerfd = 0;
 
+    swServer_close_port(serv, SW_TRUE);
+
     swTaskWorker_signal_init();
     swWorker_onStart(serv);
 
     SwooleG.main_reactor = NULL;
-    SwooleWG.worker = swProcessPool_get_worker(pool, worker_id);
+    swWorker *worker = swProcessPool_get_worker(pool, worker_id);
+    worker->start_time = SwooleGS->now;
+    worker->request_count = 0;
+    worker->traced = 0;
+    SwooleWG.worker = worker;
     SwooleWG.worker->status = SW_WORKER_IDLE;
 }
 
@@ -157,9 +156,20 @@ int swTaskWorker_finish(swServer *serv, char *data, int data_len, int flags)
         swWarn("cannot use task/finish, because no set serv->task_worker_num.");
         return SW_ERR;
     }
+	if (current_task->info.type == SW_EVENT_PIPE_MESSAGE)
+	{
+		swWarn("task/finish is not supported in onPipeMessage callback.");
+		return SW_ERR;
+	}
 
     uint16_t source_worker_id = current_task->info.from_id;
     swWorker *worker = swServer_get_worker(serv, source_worker_id);
+
+    if (worker == NULL)
+    {
+        swWarn("invalid worker_id[%d].", source_worker_id);
+        return SW_ERR;
+    }
 
     int ret;
     //for swoole_server_task
@@ -171,6 +181,10 @@ int swTaskWorker_finish(swServer *serv, char *data, int data_len, int flags)
         if (swTask_type(current_task) & SW_TASK_CALLBACK)
         {
             flags |= SW_TASK_CALLBACK;
+        }
+        else if (swTask_type(current_task) & SW_TASK_COROUTINE)
+        {
+            flags |= SW_TASK_COROUTINE;
         }
         swTask_type(&buf) = flags;
 
@@ -189,7 +203,19 @@ int swTaskWorker_finish(swServer *serv, char *data, int data_len, int flags)
             buf.info.len = data_len;
         }
 
-        ret = swWorker_send2worker(worker, &buf, sizeof(buf.info) + buf.info.len, SW_PIPE_MASTER);
+        if (worker->pool->use_socket && worker->pool->stream->last_connection > 0)
+        {
+            int32_t _len = htonl(data_len);
+            ret = swSocket_write_blocking(worker->pool->stream->last_connection, (void *) &_len, sizeof(_len));
+            if (ret > 0)
+            {
+                ret = swSocket_write_blocking(worker->pool->stream->last_connection, data, data_len);
+            }
+        }
+        else
+        {
+            ret = swWorker_send2worker(worker, &buf, sizeof(buf.info) + buf.info.len, SW_PIPE_MASTER);
+        }
     }
     else
     {
@@ -209,12 +235,7 @@ int swTaskWorker_finish(swServer *serv, char *data, int data_len, int flags)
             sw_atomic_t *finish_count = (sw_atomic_t*) result->data;
             char *_tmpfile = result->data + 4;
             int fd = open(_tmpfile, O_APPEND | O_WRONLY);
-            if (fd < 0)
-            {
-                swSysError("open(%s) failed.", _tmpfile);
-                (*finish_count) ++;
-            }
-            else
+            if (fd >= 0)
             {
                 buf.info.type = SW_EVENT_FINISH;
                 buf.info.fd = current_task->info.fd;
@@ -222,7 +243,7 @@ int swTaskWorker_finish(swServer *serv, char *data, int data_len, int flags)
                 //result pack
                 if (data_len >= SW_IPC_MAX_SIZE - sizeof(buf.info))
                 {
-                    if (swTaskWorker_large_pack(result, data, data_len) < 0)
+                    if (swTaskWorker_large_pack(&buf, data, data_len) < 0)
                     {
                         swWarn("large task pack failed()");
                         buf.info.len = 0;
@@ -233,12 +254,13 @@ int swTaskWorker_finish(swServer *serv, char *data, int data_len, int flags)
                     buf.info.len = data_len;
                     memcpy(buf.data, data, data_len);
                 }
-                sw_atomic_fetch_add(finish_count, 1);
                 //write to tmpfile
-                if (write(fd, &buf, sizeof(buf.info) + buf.info.len) < 0)
+                if (swoole_sync_writefile(fd, &buf, sizeof(buf.info) + buf.info.len) < 0)
                 {
                     swSysError("write(%s, %ld) failed.", result->data, sizeof(buf.info) + buf.info.len);
                 }
+                sw_atomic_fetch_add(finish_count, 1);
+                close(fd);
             }
         }
         else
@@ -271,9 +293,9 @@ int swTaskWorker_finish(swServer *serv, char *data, int data_len, int flags)
         {
             ret = task_notify_pipe->write(task_notify_pipe, &flag, sizeof(flag));
 #ifdef HAVE_KQUEUE
-            if (errno == EAGAIN || errno == ENOBUFS)
+            if (ret < 0 && (errno == EAGAIN || errno == ENOBUFS))
 #else
-            if (errno == EAGAIN)
+            if (ret < 0 && errno == EAGAIN)
 #endif
             {
                 if (swSocket_wait(task_notify_pipe->getFd(task_notify_pipe, 1), -1, SW_EVENT_WRITE) == 0)

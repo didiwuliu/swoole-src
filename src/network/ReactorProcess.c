@@ -162,19 +162,24 @@ int swReactorProcess_start(swServer *serv)
     }
 
     /**
-     * BASE模式，管理进程就是主进程
+     * manager process is the same as the master process
      */
     SwooleG.pid = SwooleGS->manager_pid = getpid();
     SwooleG.process_type = SW_PROCESS_MASTER;
 
+    /**
+     * manager process can not use signalfd
+     */
     SwooleG.use_timerfd = 0;
     SwooleG.use_signalfd = 0;
     SwooleG.use_timer_pipe = 0;
-    swServer_signal_init();
+    swServer_signal_init(serv);
 
     swProcessPool_start(&SwooleGS->event_workers);
     swProcessPool_wait(&SwooleGS->event_workers);
     swProcessPool_shutdown(&SwooleGS->event_workers);
+
+    swManager_kill_user_worker(serv);
 
     return SW_OK;
 }
@@ -187,41 +192,42 @@ static int swReactorProcess_onPipeRead(swReactor *reactor, swEvent *event)
     swFactory *factory = &serv->factory;
     swString *buffer_output;
 
-    if (read(event->fd, &task, sizeof(task)) > 0)
+    if (read(event->fd, &task, sizeof(task)) <= 0)
     {
-        switch(task.info.type )
-        {
-        case SW_EVENT_PIPE_MESSAGE:
-            serv->onPipeMessage(serv, &task);
-            break;
-        case SW_EVENT_FINISH:
-            serv->onFinish(serv, &task);
-            break;
-        case SW_EVENT_SENDFILE:
-            memcpy(&_send.info, &task.info, sizeof(_send.info));
-            _send.data = task.data;
-            factory->finish(factory, &_send);
-            break;
-        case SW_EVENT_PROXY_START:
-        case SW_EVENT_PROXY_END:
-            buffer_output = SwooleWG.buffer_output[task.info.from_id];
-            swString_append_ptr(buffer_output, task.data, task.info.len);
-            if (task.info.type == SW_EVENT_PROXY_END)
-            {
-                memcpy(&_send.info, &task.info, sizeof(_send.info));
-                _send.info.type = SW_EVENT_TCP;
-                _send.data = buffer_output->str;
-                _send.length = buffer_output->length;
-                factory->finish(factory, &_send);
-                swString_clear(buffer_output);
-            }
-            break;
-        default:
-            break;
-        }
-        return SW_OK;
+        return SW_ERR;
     }
-    return SW_ERR;
+
+    switch (task.info.type)
+    {
+    case SW_EVENT_PIPE_MESSAGE:
+        serv->onPipeMessage(serv, &task);
+        break;
+    case SW_EVENT_FINISH:
+        serv->onFinish(serv, &task);
+        break;
+    case SW_EVENT_SENDFILE:
+        memcpy(&_send.info, &task.info, sizeof(_send.info));
+        _send.data = task.data;
+        factory->finish(factory, &_send);
+        break;
+    case SW_EVENT_PROXY_START:
+    case SW_EVENT_PROXY_END:
+        buffer_output = SwooleWG.buffer_output[task.info.from_id];
+        swString_append_ptr(buffer_output, task.data, task.info.len);
+        if (task.info.type == SW_EVENT_PROXY_END)
+        {
+            memcpy(&_send.info, &task.info, sizeof(_send.info));
+            _send.info.type = SW_EVENT_TCP;
+            _send.data = buffer_output->str;
+            _send.length = buffer_output->length;
+            factory->finish(factory, &_send);
+            swString_clear(buffer_output);
+        }
+        break;
+    default:
+        break;
+    }
+    return SW_OK;
 }
 
 static int swReactorProcess_loop(swProcessPool *pool, swWorker *worker)
@@ -233,8 +239,12 @@ static int swReactorProcess_loop(swProcessPool *pool, swWorker *worker)
     SwooleG.pid = getpid();
 
     SwooleWG.id = worker->id;
+    if (serv->max_request > 0)
+    {
+        SwooleWG.run_always = 0;
+    }
     SwooleWG.max_request = serv->max_request;
-    SwooleWG.request_count = 0;
+    SwooleWG.worker = worker;
 
     SwooleTG.id = 0;
     if (worker->id == 0)
@@ -321,7 +331,7 @@ static int swReactorProcess_loop(swProcessPool *pool, swWorker *worker)
     //close
     reactor->setHandle(reactor, SW_FD_CLOSE, swReactorProcess_onClose);
     //pipe
-    reactor->setHandle(reactor, SW_FD_PIPE | SW_EVENT_WRITE, swReactor_onWrite);
+    reactor->setHandle(reactor, SW_FD_WRITE, swReactor_onWrite);
     reactor->setHandle(reactor, SW_FD_PIPE | SW_EVENT_READ, swReactorProcess_onPipeRead);
 
     swServer_store_listen_socket(serv);
@@ -387,13 +397,7 @@ static int swReactorProcess_loop(swProcessPool *pool, swWorker *worker)
 int swReactorProcess_onClose(swReactor *reactor, swEvent *event)
 {
     int fd = event->fd;
-    swDataHead notify_ev;
-    bzero(&notify_ev, sizeof(notify_ev));
-
-    notify_ev.from_id = reactor->id;
-    notify_ev.fd = fd;
-    notify_ev.type = SW_EVENT_CLOSE;
-
+    swServer *serv = reactor->ptr;
     swConnection *conn = swServer_connection_get(SwooleG.serv, fd);
     if (conn == NULL || conn->active == 0)
     {
@@ -401,7 +405,7 @@ int swReactorProcess_onClose(swReactor *reactor, swEvent *event)
     }
     if (reactor->del(reactor, fd) == 0)
     {
-        return SwooleG.factory->notify(SwooleG.factory, &notify_ev);
+        return swServer_tcp_notify(serv, conn, SW_EVENT_CLOSE);
     }
     else
     {
@@ -550,8 +554,9 @@ static int swReactorProcess_reuse_port(swListenPort *ls)
         return SW_ERR;
     }
     //bind address and port
-    if (swSocket_bind(sock, ls->type, ls->host, ls->port) < 0)
+    if (swSocket_bind(sock, ls->type, ls->host, &ls->port) < 0)
     {
+        close(sock);
         return SW_ERR;
     }
     //stream socket, set nonblock
