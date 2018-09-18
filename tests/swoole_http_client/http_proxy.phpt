@@ -1,22 +1,24 @@
 --TEST--
 swoole_http_client: get
 --SKIPIF--
-<?php require  __DIR__ . "/../include/skipif.inc"; ?>
+<?php
+require __DIR__ . '/../include/skipif.inc';
+skip_if_no_proxy();
+?>
 --FILE--
 <?php
-require_once __DIR__ . "/../include/swoole.inc";
+require_once __DIR__ . '/../include/bootstrap.php';
 
 $pm = new ProcessManager;
 $pm->parentFunc = function ($pid)
 {
-    $cli = new swoole_http_client('127.0.0.1', 9501);
-    $cli->setHeaders(['Host' => 'localhost']);
+    $domain = 'www.qq.com';
+    $cli = new Swoole\Http\Client($domain, 80);
+    $cli->setHeaders(['Host' => $domain]);
     $cli->set(['http_proxy_host' => HTTP_PROXY_HOST, 'http_proxy_port' => HTTP_PROXY_PORT]);
-    $cli->get('/get?json=true', function ($cli)
-    {
+    $cli->get('/', function ($cli) {
         assert($cli->statusCode == 200);
-        $ret = json_decode($cli->body, true);
-        assert(is_array($ret) and $ret['json'] == 'true');
+        assert(stripos($cli->body, 'tencent') !== false);
         $cli->close();
     });
     swoole_event::wait();

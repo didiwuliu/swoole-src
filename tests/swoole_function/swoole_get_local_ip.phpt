@@ -1,8 +1,8 @@
 --TEST--
-swoole_get_local_ip
+swoole_function: get local ip
 
 --SKIPIF--
-<?php require __DIR__ . "/../include/skipif.inc"; ?>
+<?php require __DIR__ . '/../include/skipif.inc'; ?>
 --INI--
 assert.active=1
 assert.warning=1
@@ -11,6 +11,7 @@ assert.quiet_eval=0
 
 --FILE--
 <?php
+require_once __DIR__ . '/../include/bootstrap.php';
 
 $ips = swoole_get_local_ip();
 foreach ($ips as $ip) {

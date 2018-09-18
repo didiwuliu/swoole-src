@@ -1,8 +1,11 @@
 --TEST--
-swoole_client: big_package_memory_leak
+swoole_client_async: big_package_memory_leak
 
 --SKIPIF--
-<?php require __DIR__ . "/../include/skipif.inc"; ?>
+<?php
+require __DIR__ . '/../include/skipif.inc';
+skip_if_in_docker('dead wait in docker');
+?>
 --INI--
 assert.active=1
 assert.warning=1
@@ -12,7 +15,7 @@ assert.quiet_eval=0
 
 --FILE--
 <?php
-require_once __DIR__ . "/../include/swoole.inc";
+require_once __DIR__ . '/../include/bootstrap.php';
 
 $tcp_server = __DIR__ . "/../include/memoryleak/tcp_client_memory_leak/tcp_serv.php";
 $closeServer = start_server($tcp_server, "127.0.0.1", 9001);
@@ -40,7 +43,8 @@ $cli->on("close", function (swoole_client $cli) use ($closeServer)
 });
 $cli->connect("127.0.0.1", 9001);
 assert(memory_get_usage(true) == $mem);
-echo "SUCCESS";
+echo "SUCCESS\n";
+swoole_event::wait();
 ?>
 
 --EXPECT--

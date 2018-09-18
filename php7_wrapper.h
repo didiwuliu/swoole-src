@@ -19,191 +19,32 @@
 
 #include "ext/standard/php_http.h"
 
-#if PHP_MAJOR_VERSION < 7
-typedef zend_rsrc_list_entry zend_resource;
-#define SW_RETURN_STRING                      RETURN_STRING
-#define SW_Z_ARRVAL_P                         Z_ARRVAL_P
-#define IS_TRUE                               1
-
-static inline int sw_zend_hash_find(HashTable *ht, char *k, int len, void **v)
-{
-    zval **tmp = NULL;
-    if (zend_hash_find(ht, k, len, (void **) &tmp) == SUCCESS)
-    {
-        *v = *tmp;
-        return SUCCESS;
-    }
-    else
-    {
-        *v = NULL;
-        return FAILURE;
-    }
-}
-
-#define sw_zend_hash_del                      zend_hash_del
-#define sw_zend_hash_update                   zend_hash_update
-#define sw_zend_hash_index_find               zend_hash_index_find
-#define SW_ZVAL_STRINGL                       ZVAL_STRINGL
-#define SW_ZEND_FETCH_RESOURCE_NO_RETURN      ZEND_FETCH_RESOURCE_NO_RETURN
-#define SW_ZEND_FETCH_RESOURCE                ZEND_FETCH_RESOURCE
-#define SW_ZEND_REGISTER_RESOURCE             ZEND_REGISTER_RESOURCE
-#define SW_MAKE_STD_ZVAL(p)                   MAKE_STD_ZVAL(p)
-#define SW_ALLOC_INIT_ZVAL(p)                 ALLOC_INIT_ZVAL(p)
-#define SW_SEPARATE_ZVAL(p)
-#define SW_ZVAL_STRING                        ZVAL_STRING
-#define SW_RETVAL_STRINGL                     RETVAL_STRINGL
-#define sw_smart_str                          smart_str
-#define sw_php_var_unserialize                php_var_unserialize
-#define sw_zend_is_callable                   zend_is_callable
-#define sw_zend_is_callable_ex                zend_is_callable_ex
-#define sw_zend_hash_add                      zend_hash_add
-#define sw_zend_hash_index_update             zend_hash_index_update
-#define sw_call_user_function_ex              call_user_function_ex
-
-static sw_inline int sw_call_user_function_fast(zval *function_name, zend_fcall_info_cache *fci_cache, zval **retval_ptr_ptr, uint32_t param_count, zval ***params TSRMLS_DC)
-{
-    zend_fcall_info fci;
-
-    fci.size = sizeof(fci);
-    fci.function_table = EG(function_table);
-    fci.object_ptr = NULL;
-    fci.function_name = function_name;
-    fci.retval_ptr_ptr = retval_ptr_ptr;
-    fci.param_count = param_count;
-    fci.params = params;
-    fci.no_separation = 0;
-    fci.symbol_table = NULL;
-
-    return zend_call_function(&fci, fci_cache TSRMLS_CC);
-}
-
-#define sw_copy_to_stack(a, b)
-#define SWOOLE_GET_TSRMLS                     TSRMLS_FETCH_FROM_CTX(sw_thread_ctx ? sw_thread_ctx : NULL)
-
-//----------------------------------Array API------------------------------------
-#define sw_add_assoc_string                   add_assoc_string
-#define sw_add_assoc_stringl_ex               add_assoc_stringl_ex
-#define sw_add_assoc_stringl                  add_assoc_stringl
-#define sw_add_assoc_double_ex                add_assoc_double_ex
-#define sw_add_assoc_long_ex                  add_assoc_long_ex
-#define sw_add_next_index_stringl             add_next_index_stringl
-
-#define sw_zval_ptr_dtor                      zval_ptr_dtor
-#define sw_zend_hash_copy                     zend_hash_copy
-#define sw_zval_add_ref                       zval_add_ref
-#define sw_zval_dup(val)                      (val)
-#define sw_zval_free(val)                     (sw_zval_ptr_dtor(&val))
-#define sw_zend_hash_exists                   zend_hash_exists
-#define sw_php_format_date                    php_format_date
-#define sw_php_url_encode                     php_url_encode
-#define sw_php_array_merge(dest,src)          php_array_merge(dest,src,0 TSRMLS_CC)
-#define SW_RETURN_STRINGL                     RETURN_STRINGL
-#define SW_RETVAL_STRING                      RETVAL_STRING
-#define sw_zend_register_internal_class_ex    zend_register_internal_class_ex
-
-#define sw_zend_call_method_with_0_params     zend_call_method_with_0_params
-#define sw_zend_call_method_with_1_params     zend_call_method_with_1_params
-#define sw_zend_call_method_with_2_params     zend_call_method_with_2_params
-
-typedef int zend_size_t;
-
-#define SW_HASHTABLE_FOREACH_START(ht, entry)\
-    zval **tmp = NULL;\
-    for (zend_hash_internal_pointer_reset(ht);\
-        zend_hash_has_more_elements(ht) == SUCCESS; \
-        zend_hash_move_forward(ht)) {\
-        if (zend_hash_get_current_data(ht, (void**)&tmp) == FAILURE) {\
-            continue;\
-        }\
-        entry = *tmp;
-
-#if defined(HASH_KEY_NON_EXISTANT) && !defined(HASH_KEY_NON_EXISTENT)
-#define HASH_KEY_NON_EXISTENT HASH_KEY_NON_EXISTANT
-#endif
-
-#define SW_HASHTABLE_FOREACH_START2(ht, k, klen, ktype, entry)\
-    zval **tmp = NULL; ulong_t idx;\
-    for (zend_hash_internal_pointer_reset(ht); \
-            (ktype = zend_hash_get_current_key_ex(ht, &k, &klen, &idx, 0, NULL)) != HASH_KEY_NON_EXISTENT; \
-            zend_hash_move_forward(ht)\
-        ) { \
-    if (zend_hash_get_current_data(ht, (void**)&tmp) == FAILURE) {\
-        continue;\
-    }\
-    entry = *tmp;\
-    klen --;
-
-#define SW_HASHTABLE_FOREACH_END() }
-#define sw_zend_read_property                  zend_read_property
-#define sw_zend_hash_get_current_key(a,b,c,d)  zend_hash_get_current_key_ex(a,b,c,d,0,NULL)
-
-static inline int SW_Z_TYPE_P(zval *z)
-{
-    if (Z_TYPE_P(z) == IS_BOOL)
-    {
-        if ((uint8_t) Z_BVAL_P(z) == 1)
-        {
-            return IS_TRUE;
-        }
-        else
-        {
-            return 0;
-        }
-    }
-    else
-    {
-        return Z_TYPE_P(z);
-    }
-}
-
-#define sw_php_var_serialize(a,b,c)         php_var_serialize(a,&b,c)
-#define sw_zend_get_executed_filename()     zend_get_executed_filename(TSRMLS_C)
-#define IS_TRUE    1
-inline int SW_Z_TYPE_P(zval *z);
-#define SW_Z_TYPE_PP(z)        SW_Z_TYPE_P(*z)
-static sw_inline char* sw_http_build_query(zval *data, zend_size_t *length, smart_str *formstr TSRMLS_DC)
-{
-#if PHP_MAJOR_VERSION == 5 && PHP_MINOR_VERSION == 3
-    if (php_url_encode_hash_ex(HASH_OF(data), formstr, NULL, 0, NULL, 0, NULL, 0, NULL, NULL TSRMLS_CC) == FAILURE)
-#else
-    if (php_url_encode_hash_ex(HASH_OF(data), formstr, NULL, 0, NULL, 0, NULL, 0, NULL, NULL, (int) PHP_QUERY_RFC1738 TSRMLS_CC) == FAILURE)
-#endif
-    {
-        if (formstr->c)
-        {
-            smart_str_free(formstr);
-        }
-        return NULL;
-    }
-    if (!formstr->c)
-    {
-        return NULL;
-    }
-    smart_str_0(formstr);
-    *length = formstr->len;
-    return formstr->c;
-}
-
-#define sw_get_object_handle(object)        Z_OBJ_HANDLE_P(object)
-
-#else /* PHP Version 7 */
 #define sw_php_var_serialize                php_var_serialize
 typedef size_t zend_size_t;
 #define ZEND_SET_SYMBOL(ht,str,arr)         zval_add_ref(arr); zend_hash_str_update(ht, str, sizeof(str)-1, arr);
 
-static sw_inline int Z_BVAL_P(zval *v)
+static sw_inline zend_bool Z_BVAL_P(zval *v)
 {
-    if (Z_TYPE_P(v) == IS_TRUE)
-    {
-        return 1;
-    }
-    else
-    {
-        return 0;
-    }
+    return Z_TYPE_P(v) == IS_TRUE;
 }
 
 //----------------------------------Array API------------------------------------
+
+static sw_inline int add_assoc_ulong_safe(zval *arg, const char *key, zend_ulong value)
+{
+    if (likely(value <= ZEND_LONG_MAX))
+    {
+        return add_assoc_long(arg, key, value);
+    }
+    else
+    {
+        char buf[MAX_LENGTH_OF_LONG + 1];
+        memset((char *) buf, 0, MAX_LENGTH_OF_LONG + 1);
+        sprintf((char *) buf, ZEND_ULONG_FMT, value);
+        return add_assoc_string(arg, key, buf);
+    }
+}
+
 #define sw_add_assoc_stringl(__arg, __key, __str, __length, __duplicate)   add_assoc_stringl_ex(__arg, __key, strlen(__key), __str, __length)
 static sw_inline int sw_add_assoc_stringl_ex(zval *arg, const char *key, size_t key_len, char *str, size_t length, int __duplicate)
 {
@@ -264,7 +105,7 @@ static sw_inline char* sw_php_url_encode(char *value, size_t value_len, int* ext
 static sw_inline int sw_call_user_function_ex(HashTable *function_table, zval** object_pp, zval *function_name, zval **retval_ptr_ptr, uint32_t param_count, zval ***params, int no_separation, HashTable* ymbol_table)
 {
     zval real_params[SW_PHP_MAX_PARAMS_NUM];
-    int i = 0;
+    uint32_t i = 0;
     for (; i < param_count; i++)
     {
         real_params[i] = **params[i];
@@ -279,7 +120,7 @@ static sw_inline int sw_call_user_function_ex(HashTable *function_table, zval** 
 static sw_inline int sw_call_user_function_fast(zval *function_name, zend_fcall_info_cache *fci_cache, zval **retval_ptr_ptr, uint32_t param_count, zval ***params)
 {
     zval real_params[SW_PHP_MAX_PARAMS_NUM];
-    int i = 0;
+    uint32_t i = 0;
     for (; i < param_count; i++)
     {
         real_params[i] = **params[i];
@@ -290,7 +131,7 @@ static sw_inline int sw_call_user_function_fast(zval *function_name, zend_fcall_
 
     zend_fcall_info fci;
     fci.size = sizeof(fci);
-#if PHP_MINOR_VERSION == 0
+#if PHP_MAJOR_VERSION == 7 && PHP_MINOR_VERSION == 0
     fci.function_table = EG(function_table);
     fci.symbol_table = NULL;
 #endif
@@ -343,12 +184,11 @@ static sw_inline int sw_call_user_function_fast(zval *function_name, zend_fcall_
     if (ZVAL_IS_NULL(&__retval)) *(retval) = NULL;\
     else *(retval) = &__retval;
 
-#define SWOOLE_GET_TSRMLS
 #define SW_ZVAL_STRINGL(z, s, l, dup)         ZVAL_STRINGL(z, s, l)
 #define SW_ZVAL_STRING(z,s,dup)               ZVAL_STRING(z,s)
 #define sw_smart_str                          smart_string
 #define zend_get_class_entry                  Z_OBJCE_P
-#define sw_copy_to_stack(a, b)                {zval *__tmp = a;\
+#define sw_copy_to_stack(a, b)                {zval *__tmp = (zval *) a;\
     a = &b;\
     memcpy(a, __tmp, sizeof(zval));}
 
@@ -366,10 +206,38 @@ static sw_inline void sw_zval_free(zval *val)
     efree(val);
 }
 
-static sw_inline zval* sw_zend_read_property(zend_class_entry *class_ptr, zval *obj, char *s, int len, int silent)
+static sw_inline zval* sw_zend_read_property(zend_class_entry *class_ptr, zval *obj, const char *s, int len, int silent)
 {
     zval rv;
     return zend_read_property(class_ptr, obj, s, len, silent, &rv);
+}
+
+static sw_inline zval* sw_zend_read_property_not_null(zend_class_entry *class_ptr, zval *obj, const char *s, int len, int silent)
+{
+    zval rv;
+    zval *property = zend_read_property(class_ptr, obj, s, len, silent, &rv);
+    return ZVAL_IS_NULL(property) ? NULL : property;
+}
+
+static sw_inline zval* sw_zend_read_property_array(zend_class_entry *class_ptr, zval *obj, const char *s, int len, int silent)
+{
+    zval rv, *property = zend_read_property(class_ptr, obj, s, len, silent, &rv);
+    zend_uchar ztype = Z_TYPE_P(property);
+    if (ztype != IS_ARRAY)
+    {
+        zval temp_array;
+        array_init(&temp_array);
+        zend_update_property(class_ptr, obj, s, len, &temp_array TSRMLS_CC);
+        zval_ptr_dtor(&temp_array);
+        // NOTICE: if user unset the property, this pointer will be changed
+        // some objects such as `swoole_http2_request` always be writable
+        if (ztype == IS_UNDEF)
+        {
+            property = zend_read_property(class_ptr, obj, s, len, silent, &rv);
+        }
+    }
+
+    return property;
 }
 
 static sw_inline int sw_zend_is_callable(zval *cb, int a, char **name)
@@ -414,7 +282,7 @@ static inline int sw_zend_hash_update(HashTable *ht, char *k, int len, zval *val
     return zend_hash_str_update(ht, (const char*)k, len -1, val) ? SUCCESS : FAILURE;
 }
 
-static inline int sw_zend_hash_find(HashTable *ht, char *k, int len, void **v)
+static inline int sw_zend_hash_find(HashTable *ht, const char *k, int len, void **v)
 {
     zval *value = zend_hash_str_find(ht, k, len - 1);
     if (value == NULL)
@@ -428,17 +296,28 @@ static inline int sw_zend_hash_find(HashTable *ht, char *k, int len, void **v)
     }
 }
 
-static inline int sw_zend_hash_exists(HashTable *ht, char *k, int len)
+static inline int sw_zend_register_class_alias(const char *name, zend_class_entry *ce)
 {
-    zval *value = zend_hash_str_find(ht, k, len - 1);
-    if (value == NULL)
+    int name_len = strlen(name);
+    zend_string *_name;
+    if (name[0] == '\\')
     {
-        return FAILURE;
+        _name = zend_string_init(name, name_len, 1);
+        zend_str_tolower_copy(ZSTR_VAL(_name), name + 1, name_len - 1);
     }
     else
     {
-        return SUCCESS;
+        _name = zend_string_init(name, strlen(name), 1);
+        zend_str_tolower_copy(ZSTR_VAL(_name), name, name_len);
     }
+
+    zend_string *_interned_name = zend_new_interned_string(_name);
+
+#if PHP_VERSION_ID >= 70300
+    return zend_register_class_alias_ex(_interned_name->val, _interned_name->len, ce, 1);
+#else
+    return zend_register_class_alias_ex(_interned_name->val, _interned_name->len, ce);
+#endif
 }
 
 static sw_inline char* sw_http_build_query(zval *data, zend_size_t *length, smart_str *formstr TSRMLS_DC)
@@ -462,6 +341,6 @@ static sw_inline char* sw_http_build_query(zval *data, zend_size_t *length, smar
 
 #define sw_get_object_handle(object)    Z_OBJ_HANDLE(*object)
 
-#endif /* PHP Version */
+#define SW_PREVENT_USER_DESTRUCT if(unlikely(!(GC_FLAGS(Z_OBJ_P(getThis())) & IS_OBJ_DESTRUCTOR_CALLED))){RETURN_NULL()}
 
 #endif /* EXT_SWOOLE_PHP7_WRAPPER_H_ */

@@ -1,8 +1,8 @@
 --TEST--
-swoole_table key-value operate
+swoole_table: key-value operate
 
 --SKIPIF--
-<?php require  __DIR__ . "/../include/skipif.inc"; ?>
+<?php require  __DIR__ . '/../include/skipif.inc'; ?>
 
 --INI--
 assert.active=1
@@ -12,6 +12,8 @@ assert.quiet_eval=0
 
 --FILE--
 <?php
+require_once __DIR__ . '/../include/bootstrap.php';
+
 $table = new swoole_table(65536);
 
 $table->column('id', swoole_table::TYPE_INT);

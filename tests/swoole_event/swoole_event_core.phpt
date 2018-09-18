@@ -2,7 +2,10 @@
 swoole_event: swoole_event_exit coredump
 
 --SKIPIF--
-<?php require  __DIR__ . "/../include/skipif.inc"; ?>
+<?php
+require __DIR__ . '/../include/skipif.inc';
+skip_if_in_docker('foreign network dns error');
+?>
 --INI--
 assert.active=1
 assert.warning=1
@@ -13,6 +16,8 @@ assert.quiet_eval=0
 --FILE--
 
 <?php
+require_once __DIR__ . '/../include/bootstrap.php';
+
 function dnsLookup() {
     swoole_async_dns_lookup("www.qq.com", function($host, $ip) {
         swoole_event_exit();

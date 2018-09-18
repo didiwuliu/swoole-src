@@ -44,10 +44,13 @@ typedef struct
     z_stream gzip_stream;
     swString *gzip_buffer;
 #endif
-#if PHP_MAJOR_VERSION >= 7
     zval _callback;
     zval _response_object;
-#endif
+
+    // flow control
+    uint32_t send_window;
+    uint32_t recv_window;
+
 } http2_client_stream;
 
 typedef struct
@@ -55,7 +58,6 @@ typedef struct
     uint8_t ssl;
     uint8_t connecting;
     uint8_t ready;
-    uint8_t send_setting;
 
 #ifdef SW_COROUTINE
     uint8_t iowait;
@@ -63,9 +65,13 @@ typedef struct
     swClient *client;
 #endif
 
-    uint32_t stream_id;
+    uint32_t stream_id; // the next send stream id
+    uint32_t last_stream_id; // the last received stream id
 
-    uint32_t window_size;
+    // flow control
+    uint32_t send_window;
+    uint32_t recv_window;
+
     uint32_t max_concurrent_streams;
     uint32_t max_frame_size;
     uint32_t max_header_list_size;
@@ -75,6 +81,7 @@ typedef struct
     int port;
 
     nghttp2_hd_inflater *inflater;
+    nghttp2_hd_deflater *deflater;
     zval *object;
     double timeout;
 
@@ -134,7 +141,7 @@ static sw_inline void http2_client_send_setting(swClient *cli)
     id = htons(SW_HTTP2_SETTINGS_INIT_WINDOW_SIZE);
     memcpy(p, &id, sizeof(id));
     p += 2;
-    value = htonl(65535);
+    value = htonl(SW_HTTP2_DEFAULT_WINDOW_SIZE);
     memcpy(p, &value, sizeof(value));
     p += 4;
 
@@ -142,8 +149,18 @@ static sw_inline void http2_client_send_setting(swClient *cli)
     cli->send(cli, frame, SW_HTTP2_FRAME_HEADER_SIZE + 18, 0);
 }
 
+static sw_inline void http2_client_send_window_update(swClient *cli, int stream_id, uint32_t size)
+{
+    char frame[SW_HTTP2_FRAME_HEADER_SIZE + SW_HTTP2_WINDOW_UPDATE_SIZE];
+    swTraceLog(SW_TRACE_HTTP2, "["SW_ECHO_YELLOW"] stream_id=%d, size=%d", "WINDOW_UPDATE", stream_id, size);
+    *(uint32_t*) ((char *)frame + SW_HTTP2_FRAME_HEADER_SIZE) = htonl(size);
+    swHttp2_set_frame_header(frame, SW_HTTP2_TYPE_WINDOW_UPDATE, SW_HTTP2_WINDOW_UPDATE_SIZE, 0, stream_id);
+    cli->send(cli, frame, SW_HTTP2_FRAME_HEADER_SIZE + SW_HTTP2_WINDOW_UPDATE_SIZE, 0);
+}
+
 static sw_inline void http2_add_header(nghttp2_nv *headers, char *k, int kl, char *v, int vl)
 {
+    k = zend_str_tolower_dup(k, kl); // auto to lower
     headers->name = (uchar*) k;
     headers->namelen = kl;
     headers->value = (uchar*) v;
@@ -153,8 +170,5 @@ static sw_inline void http2_add_header(nghttp2_nv *headers, char *k, int kl, cha
 }
 
 void http2_add_cookie(nghttp2_nv *nv, int *index, zval *cookies TSRMLS_DC);
-
-extern swString *cookie_buffer;
-extern zend_class_entry *swoole_client_class_entry_ptr;
 
 #endif
