@@ -14,90 +14,58 @@
   +----------------------------------------------------------------------+
 */
 
-#ifndef SW_CLIENT_H_
-#define SW_CLIENT_H_
+#pragma once
 
-#ifdef __cplusplus
-extern "C"
-{
-#endif
+#include "swoole_api.h"
+#include "swoole_string.h"
+#include "swoole_socket.h"
+#include "swoole_reactor.h"
+#include "swoole_protocol.h"
+#include "proxy.h"
+#include "ssl.h"
 
-#include "buffer.h"
-#include "connection.h"
+#define SW_SOCK_ASYNC 1
+#define SW_SOCK_SYNC 0
 
-#define SW_SOCK_ASYNC    1
-#define SW_SOCK_SYNC     0
+#define SW_HTTPS_PROXY_HANDSHAKE_RESPONSE "HTTP/1.1 200 Connection established"
 
-#define SW_HTTPS_PROXY_HANDSHAKE_RESPONSE  "HTTP/1.1 200 Connection established"
-
-enum swClient_pipe_flag
-{
-    SW_CLIENT_PIPE_TCP_SESSION = 1,
-};
-
-enum swHttp_proxy_state
-{
-    SW_HTTP_PROXY_STATE_WAIT = 0,
-    SW_HTTP_PROXY_STATE_HANDSHAKE,
-    SW_HTTP_PROXY_STATE_READY,
-};
-
-struct _http_proxy
-{
-    uint8_t state;
-    uint8_t ssl;
-    int proxy_port;
-    char *proxy_host;
-    char *user;
-    char *password;
-    int l_user;
-    int l_password;
-    char *target_host;
-    int l_target_host;
-    int target_port;
-    char buf[600];
-};
-
-typedef struct _swClient
-{
+struct swClient {
     int id;
     int type;
-    long timeout_id; //timeout node id
+    long timeout_id;  // timeout node id
     int _sock_type;
     int _sock_domain;
     int _protocol;
-    int reactor_fdtype;
+    enum swFd_type reactor_fdtype;
 
-    int _redirect_to_file;
-    int _redirect_to_socket;
-    int _redirect_to_session;
-
-    uint32_t async :1;
-    uint32_t keep :1;
-    uint32_t destroyed :1;
-    uint32_t redirect :1;
-    uint32_t http2 :1;
-    uint32_t sleep :1;
-    uint32_t wait_dns :1;
-    uint32_t shutdow_rw :1;
-    uint32_t shutdown_read :1;
-    uint32_t shutdown_write :1;
-    uint32_t remove_delay :1;
+    uchar active : 1;
+    uchar async : 1;
+    uchar keep : 1;
+    uchar destroyed : 1;
+    uchar http2 : 1;
+    uchar sleep : 1;
+    uchar wait_dns : 1;
+    uchar shutdow_rw : 1;
+    uchar shutdown_read : 1;
+    uchar shutdown_write : 1;
+    uchar remove_delay : 1;
+    uchar closed : 1;
+    uchar high_watermark : 1;
 
     /**
      * one package: length check
      */
-    uint32_t open_length_check :1;
-    uint32_t open_eof_check :1;
+    uchar open_length_check : 1;
+    uchar open_eof_check : 1;
 
     swProtocol protocol;
-    struct _swSocks5 *socks5_proxy;
-    struct _http_proxy* http_proxy;
+    swSocks5_proxy *socks5_proxy;
+    swHttp_proxy *http_proxy;
 
     uint32_t reuse_count;
 
-    char *server_str;
-    char *server_host;
+    const char *server_str;
+    const char *server_host;
     int server_port;
     void *ptr;
     void *params;
@@ -121,46 +89,40 @@ typedef struct _swClient
      */
     swSocketAddress remote_addr;
 
-    swConnection *socket;
-
-    /**
-     * reactor
-     */
-    swReactor *reactor;
+    swSocket *socket;
 
     void *object;
 
     swString *buffer;
     uint32_t wait_length;
-    uint32_t buffer_input_size;
+    uint32_t input_buffer_size;
 
     uint32_t buffer_high_watermark;
     uint32_t buffer_low_watermark;
 
 #ifdef SW_USE_OPENSSL
-    uint8_t open_ssl :1;
-    uint8_t ssl_wait_handshake :1;
+    uchar open_ssl : 1;
+    uchar ssl_wait_handshake : 1;
     SSL_CTX *ssl_context;
     swSSL_option ssl_option;
 #endif
 
-    void (*onConnect)(struct _swClient *cli);
-    void (*onError)(struct _swClient *cli);
-    void (*onReceive)(struct _swClient *cli, char *data, uint32_t length);
-    void (*onClose)(struct _swClient *cli);
-    void (*onBufferFull)(struct _swClient *cli);
-    void (*onBufferEmpty)(struct _swClient *cli);
+    void (*onConnect)(swClient *cli);
+    void (*onError)(swClient *cli);
+    void (*onReceive)(swClient *cli, const char *data, uint32_t length);
+    void (*onClose)(swClient *cli);
+    void (*onBufferFull)(swClient *cli);
+    void (*onBufferEmpty)(swClient *cli);
 
-    int (*connect)(struct _swClient *cli, char *host, int port, double _timeout, int sock_flag);
-    int (*send)(struct _swClient *cli, char *data, int length, int flags);
-    int (*sendfile)(struct _swClient *cli, char *filename, off_t offset, size_t length);
-    int (*recv)(struct _swClient *cli, char *data, int len, int flags);
-    int (*pipe)(struct _swClient *cli, int write_fd, int is_session_id);
-    int (*close)(struct _swClient *cli);
+    int (*connect)(swClient *cli, const char *host, int port, double _timeout, int sock_flag);
+    int (*send)(swClient *cli, const char *data, size_t length, int flags);
+    int (*sendfile)(swClient *cli, const char *filename, off_t offset, size_t length);
+    int (*recv)(swClient *cli, char *data, uint32_t len, int flags);
+    int (*close)(swClient *cli);
+};
 
-} swClient;
-
-int swClient_create(swClient *cli, int type, int async);
+void swClient_init_reactor(swReactor *reactor);
+int swClient_create(swClient *cli, enum swSocket_type type, int async);
 int swClient_sleep(swClient *cli);
 int swClient_wakeup(swClient *cli);
 int swClient_shutdown(swClient *cli, int __how);
@@ -170,39 +132,19 @@ int swClient_ssl_handshake(swClient *cli);
 int swClient_ssl_verify(swClient *cli, int allow_self_signed);
 #endif
 void swClient_free(swClient *cli);
-
-typedef struct
-{
-    uint8_t num;
-    struct
-    {
-        uint8_t length;
-        char address[16];
-    } hosts[SW_DNS_HOST_BUFFER_SIZE];
-} swDNSResolver_result;
-
-int swDNSResolver_request(char *domain, void (*callback)(char *, swDNSResolver_result *, void *), void *data);
-int swDNSResolver_free();
-
 //----------------------------------------Stream---------------------------------------
-typedef struct _swStream
-{
+struct swStream {
     swString *buffer;
-    uint32_t session_id;
     uint8_t cancel;
-    void (*response)(struct _swStream *stream, char *data, uint32_t length);
+    int errCode;
+    void *private_data;
+    void (*response)(swStream *stream, const char *data, uint32_t length);
     swClient client;
-} swStream;
+};
 
-swStream* swStream_new(char *dst_host, int dst_port, int type);
-int swStream_send(swStream *stream, char *data, size_t length);
+swStream *swStream_new(const char *dst_host, int dst_port, enum swSocket_type type);
+int swStream_send(swStream *stream, const char *data, size_t length);
 void swStream_set_protocol(swProtocol *protocol);
 void swStream_set_max_length(swStream *stream, uint32_t max_length);
-int swStream_recv_blocking(int fd, void *__buf, size_t __len);
+int swStream_recv_blocking(swSocket *sock, void *__buf, size_t __len);
 //----------------------------------------Stream End------------------------------------
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* SW_CLIENT_H_ */

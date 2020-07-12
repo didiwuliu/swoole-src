@@ -26,7 +26,7 @@ if (pcntl_fork() === 0) {
          */
 
 
-        assert($cli->isConnected() === true);
+        Assert::true($cli->isConnected());
         $cli->send(str_repeat("\0", 1024));
         // $cli->sendfile(__DIR__.'/test.txt');
     });
@@ -51,7 +51,7 @@ if (pcntl_fork() === 0) {
     $cli->timeo_id = swoole_timer_after(1000, function() use($cli) {
         debug_log("connect timeout");
         $cli->close();
-        assert($cli->isConnected() === false);
+        Assert::false($cli->isConnected());
     });
 
     exit();
@@ -71,7 +71,7 @@ class TcpServer
     {
         $this->swooleServer = new \swoole_server(TCP_SERVER_HOST, TCP_SERVER_PORT, SWOOLE_PROCESS, SWOOLE_SOCK_TCP);
         $this->swooleServer->set([
-            "buffer_output_size" => 1024 * 1024 * 1024, // 输出限制
+            "output_buffer_size" => 1024 * 1024 * 1024, // 输出限制
             "max_connection" => 10240,
             "pipe_buffer_size" => 1024 * 1024 * 1024,
 

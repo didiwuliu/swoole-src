@@ -2,31 +2,31 @@
 swoole_process: alarm
 --SKIPIF--
 <?php require __DIR__ . '/../include/skipif.inc'; ?>
---INI--
-assert.active=1
-assert.warning=1
-assert.bail=0
-assert.quiet_eval=0
-
-
 --FILE--
 <?php
-require_once __DIR__ . '/../include/bootstrap.php';
+require __DIR__ . '/../include/bootstrap.php';
 
-swoole_process::signal(SIGALRM, function () {
+use Swoole\Process;
+
+Process::signal(SIGALRM, function () {
     static $i = 0;
     echo "#{$i}\talarm\n";
     $i++;
     if ($i > 10) {
-        swoole_process::alarm(-1);
-        swoole_process::signal(SIGALRM, null);
+        Process::alarm(-1);
+        Process::signal(SIGALRM, null);
+        Swoole\Event::del(STDIN);
         swoole_event_exit();
     }
 });
 
 //100ms
-swoole_process::alarm(10 * 1000);
-swoole_event_wait();
+Process::alarm(10 * 1000);
+
+//never calback
+Swoole\Event::add(STDIN, function () {});
+
+Swoole\Event::wait();
 
 ?>
 --EXPECT--

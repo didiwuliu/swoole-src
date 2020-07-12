@@ -1,11 +1,12 @@
 --TEST--
 swoole_http_client_coro: https client
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc';
+skip_if_offline();
+?>
 --FILE--
 <?php
-require_once __DIR__ . '/../include/bootstrap.php';
-require_once __DIR__ . '/../include/lib/curl.php';
+require __DIR__ . '/../include/bootstrap.php';
 
 go(function () {
     $cli = new Swoole\Coroutine\Http\Client('www.baidu.com', 443, true);

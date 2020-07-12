@@ -4,7 +4,7 @@ swoole_websocket_server: websocket greeter and reply twice
 <?php require __DIR__ . '/../include/skipif.inc'; ?>
 --FILE--
 <?php
-require_once __DIR__ . '/../include/bootstrap.php';
+require __DIR__ . '/../include/bootstrap.php';
 $count = 0;
 $pm = new ProcessManager;
 $pm->parentFunc = function (int $pid) use ($pm, &$count) {
@@ -14,24 +14,24 @@ $pm->parentFunc = function (int $pid) use ($pm, &$count) {
             $cli = new \Swoole\Coroutine\Http\Client('127.0.0.1', $pm->getFreePort());
             $cli->set(['timeout' => 5]);
             $ret = $cli->upgrade('/');
-            assert($ret);
-            $data = sha1(openssl_random_pseudo_bytes(mt_rand(0, 1024)));
+            Assert::assert($ret);
+            $data = sha1(get_safe_random(mt_rand(0, 1024)));
             for ($n = MAX_REQUESTS; $n--;) {
                 $cli->push($data);
                 $ret = $cli->recv();
-                assert($ret->data === "Hello {$data}!");
+                Assert::same($ret->data, "Hello {$data}!");
                 $ret = $cli->recv();
-                assert($ret->data === "How are you, {$data}?");
+                Assert::same($ret->data, "How are you, {$data}?");
                 $count++;
             }
         });
     }
     swoole_event_wait();
-    assert($count === (MAX_CONCURRENCY * MAX_REQUESTS));
+    Assert::same($count, (MAX_CONCURRENCY * MAX_REQUESTS));
     $pm->kill();
 };
 $pm->childFunc = function () use ($pm) {
-    $serv = new swoole_websocket_server('127.0.0.1', $pm->getFreePort(), mt_rand(0, 1) ? SWOOLE_BASE : SWOOLE_PROCESS);
+    $serv = new swoole_websocket_server('127.0.0.1', $pm->getFreePort(), SERVER_MODE_RANDOM);
     $serv->set([
         // 'worker_num' => 1,
         'log_file' => '/dev/null'

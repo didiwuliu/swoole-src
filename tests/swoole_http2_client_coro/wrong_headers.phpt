@@ -1,12 +1,14 @@
 --TEST--
 swoole_http2_client_coro: http2 with wrong headers
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc';
+skip_if_offline();
+?>
 --FILE--
 <?php
-require_once __DIR__ . '/../include/bootstrap.php';
+require __DIR__ . '/../include/bootstrap.php';
 go(function () {
-    $domain = 'www.swoole.com';
+    $domain = 'mail.qq.com';
     $cli = new Swoole\Coroutine\Http2\Client($domain, 443, true);
     $cli->set([
         'timeout' => 10,
@@ -14,15 +16,15 @@ go(function () {
     ]);
     $cli->connect();
 
-    $req = new swoole_http2_request;
+    $req = new Swoole\Http2\Request;
     $req->path = '/';
     $req->headers = 1;
-    assert($cli->send($req));
-    assert(is_array($req->headers)); // check array
+    Assert::assert($cli->send($req));
+    Assert::assert(is_array($req->headers)); // check array
     /**@var $response swoole_http2_response */
     $response = $cli->recv();
     echo $response->statusCode;
-    assert(stripos($response->data, 'swoole') !== false);
+    Assert::assert(stripos($response->data, 'tencent') !== false);
 });
 ?>
 --EXPECT--

@@ -14,18 +14,10 @@
   +----------------------------------------------------------------------+
 */
 
-#ifndef SW_BASE64_H__
-#define SW_BASE64_H__
-
-enum
-{
-    BASE64_OK = 0, BASE64_INVALID
-};
+#pragma once
 
 #define BASE64_ENCODE_OUT_SIZE(s) (((s) + 2) / 3 * 4)
 #define BASE64_DECODE_OUT_SIZE(s) (((s)) / 4 * 3)
 
-int swBase64_encode(unsigned char *in, int inlen, char *out);
-int swBase64_decode(char *in, int inlen, unsigned char *out);
-
-#endif /* SW_BASE64_H__ */
+size_t swBase64_encode(const unsigned char *in, size_t inlen, char *out);
+size_t swBase64_decode(const char *in, size_t inlen, char *out);

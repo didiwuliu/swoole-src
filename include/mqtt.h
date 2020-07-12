@@ -15,59 +15,43 @@
  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
  +----------------------------------------------------------------------+
  */
-
-#ifndef SW_MQTT_H_
-#define SW_MQTT_H_
+#pragma once
 
 #include "swoole.h"
+#include "swoole_protocol.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#define SW_MQTT_MIN_LENGTH 2
+#define SW_MQTT_MAX_PAYLOAD_SIZE 268435455
 
-#define SW_MQTT_MIN_LENGTH                   2
-#define SW_MQTT_MAX_PAYLOAD_SIZE             268435455
-
-enum swMqtt_type
-{
-    CONNECT = 0x10,
-    CONNACK = 0x20,
-    PUBLISH = 0x30,
-    PUBACK = 0x40,
-    PUBREC = 0x50,
-    PUBREL = 0x60,
-    PUBCOMP = 0x70,
-    SUBSCRIBE = 0x80,
-    SUBACK = 0x90,
-    UNSUBSCRIBE = 0xA0,
-    UNSUBACK = 0xB0,
-    PINGREQ = 0xC0,
-    PINGRESP = 0xD0,
-    DISCONNECT = 0xE0,
+enum swMqtt_opcode {
+    SW_MQTT_CONNECT = 0x10,
+    SW_MQTT_CONNACK = 0x20,
+    SW_MQTT_PUBLISH = 0x30,
+    SW_MQTT_PUBACK = 0x40,
+    SW_MQTT_PUBREC = 0x50,
+    SW_MQTT_PUBREL = 0x60,
+    SW_MQTT_PUBCOMP = 0x70,
+    SW_MQTT_SUBSCRIBE = 0x80,
+    SW_MQTT_SUBACK = 0x90,
+    SW_MQTT_UNSUBSCRIBE = 0xA0,
+    SW_MQTT_UNSUBACK = 0xB0,
+    SW_MQTT_PINGREQ = 0xC0,
+    SW_MQTT_PINGRESP = 0xD0,
+    SW_MQTT_DISCONNECT = 0xE0,
 };
 
-typedef struct
-{
-    uint8_t type :4;
-    uint8_t dup :1;
-    uint8_t qos :2;
-    uint8_t retain :1;
-
+struct swMqtt_packet {
+    uint8_t type : 4;
+    uint8_t dup : 1;
+    uint8_t qos : 2;
+    uint8_t retain : 1;
     uint32_t length;
-
     char protocol_name[8];
+};
 
-} swMqtt_package;
+#define SETRETAIN(HDR, R) (HDR | (R))
+#define SETQOS(HDR, Q) (HDR | ((Q) << 1))
+#define SETDUP(HDR, D) (HDR | ((D) << 3))
 
-
-#define SETRETAIN(HDR, R)   (HDR | (R))
-#define SETQOS(HDR, Q)      (HDR | ((Q) << 1))
-#define SETDUP(HDR, D)      (HDR | ((D) << 3))
-
-int swMqtt_get_package_length(swProtocol *protocol, swConnection *conn, char *data, uint32_t size);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* SW_MQTT_H_ */
+ssize_t swMqtt_get_package_length(swProtocol *protocol, swSocket *conn, const char *data, uint32_t size);
+void swMqtt_set_protocol(swProtocol *protocol);

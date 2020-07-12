@@ -14,63 +14,54 @@
   +----------------------------------------------------------------------+
 */
 
-#ifndef SW_BUFFER_H_
-#define SW_BUFFER_H_
+#pragma once
 
-#ifdef __cplusplus
-extern "C"
-{
-#endif
-
-enum swBufferChunk
-{
+enum swBuffer_chunk_type {
     SW_CHUNK_DATA,
     SW_CHUNK_SENDFILE,
     SW_CHUNK_CLOSE,
 };
 
-typedef struct _swBuffer_chunk
-{
+struct swBuffer_chunk {
     uint32_t type;
     uint32_t length;
     uint32_t offset;
-    union
-    {
+    union {
         void *ptr;
-        struct
-        {
+        struct {
             uint32_t val1;
             uint32_t val2;
         } data;
     } store;
     uint32_t size;
-    void (*destroy)(struct _swBuffer_chunk *chunk);
-    struct _swBuffer_chunk *next;
-} swBuffer_chunk;
+    void (*destroy)(swBuffer_chunk *chunk);
+    swBuffer_chunk *next;
+};
 
-typedef struct _swBuffer
-{
+struct swBuffer {
     int fd;
-    uint8_t chunk_num; //chunk数量
-    uint16_t chunk_size;
+    uint32_t chunk_num;
+    /**
+     * 0: donot use chunk
+     */
+    uint32_t chunk_size;
     uint32_t length;
     swBuffer_chunk *head;
     swBuffer_chunk *tail;
-} swBuffer;
+};
 
-#define swBuffer_get_chunk(buffer)   (buffer->head)
-#define swBuffer_empty(buffer)       (buffer == NULL || buffer->head == NULL)
+static inline swBuffer_chunk *swBuffer_get_chunk(swBuffer *buffer) {
+    return buffer->head;
+}
 
-swBuffer* swBuffer_new(int chunk_size);
+static inline bool swBuffer_empty(swBuffer *buffer) {
+    return buffer == nullptr || buffer->head == nullptr;
+}
+
+swBuffer *swBuffer_new(uint32_t chunk_size);
 swBuffer_chunk *swBuffer_new_chunk(swBuffer *buffer, uint32_t type, uint32_t size);
 void swBuffer_pop_chunk(swBuffer *buffer, swBuffer_chunk *chunk);
-int swBuffer_append(swBuffer *buffer, void *data, uint32_t size);
+int swBuffer_append(swBuffer *buffer, const void *data, uint32_t size);
 
 void swBuffer_debug(swBuffer *buffer, int print_data);
 int swBuffer_free(swBuffer *buffer);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* SW_BUFFER_H_ */

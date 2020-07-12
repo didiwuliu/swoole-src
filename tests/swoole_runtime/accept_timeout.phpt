@@ -3,13 +3,10 @@ swoole_runtime: accept timeout
 --SKIPIF--
 <?php
 require __DIR__ . '/../include/skipif.inc';
-if (!defined("SWOOLE_SSL")) {
-    echo "skip";
-}
 ?>
 --FILE--
 <?php
-require_once __DIR__ . '/../include/bootstrap.php';
+require __DIR__ . '/../include/bootstrap.php';
 
 swoole\runtime::enableCoroutine();
 
@@ -25,11 +22,10 @@ go(function () {
         echo "$errstr ($errno)<br />\n";
     } else {
         $conn = @stream_socket_accept($socket, 1);
-        assert($conn == false);
+        Assert::false($conn);
     }
 });
 
 swoole_event_wait();
 ?>
 --EXPECT--
-

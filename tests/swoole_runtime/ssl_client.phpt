@@ -3,13 +3,12 @@ swoole_runtime: ssl client
 --SKIPIF--
 <?php
 require __DIR__ . '/../include/skipif.inc';
-if (!defined("SWOOLE_SSL")) {
-    echo "skip";
-}
+skip_if_no_ssl();
+skip_if_offline();
 ?>
 --FILE--
 <?php
-require_once __DIR__ . '/../include/bootstrap.php';
+require __DIR__ . '/../include/bootstrap.php';
 
 swoole\runtime::enableCoroutine();
 
@@ -25,10 +24,9 @@ go(function () {
             $content .= fread($fp, 1024);
         }
         fclose($fp);
-        assert(strpos($content,'map.baidu.com') !== false);
+        Assert::assert(strpos($content,'map.baidu.com') !== false);
     }
 });
 swoole_event_wait();
 ?>
 --EXPECT--
-

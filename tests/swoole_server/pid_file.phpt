@@ -2,40 +2,36 @@
 swoole_server: pid_file
 --SKIPIF--
 <?php require __DIR__ . '/../include/skipif.inc'; ?>
---INI--
-assert.active=1
-assert.warning=1
-assert.bail=0
-assert.quiet_eval=0
-
-
 --FILE--
 <?php
-require_once __DIR__ . '/../include/bootstrap.php';
+require __DIR__ . '/../include/bootstrap.php';
 const PID_FILE = __DIR__.'/test.pid';
-$port = 9508;
+$pm = new SwooleTest\ProcessManager;
+use Swoole\Coroutine\Client;
+use Swoole\Timer;
+use Swoole\Event;
+use Swoole\Server;
 
-$pm = new ProcessManager;
-$pm->parentFunc = function ($pid) use ($port)
+$pm->parentFunc = function ($pid)
 {
-    assert(is_file(PID_FILE));
+    Assert::assert(is_file(PID_FILE));
     swoole_process::kill($pid);
 };
 
-$pm->childFunc = function () use ($pm, $port)
+$pm->childFunc = function () use ($pm)
 {
     ini_set('swoole.display_errors', 'Off');
-    $serv = new swoole_server("127.0.0.1", $port);
+    $serv = new Server('127.0.0.1', $pm->getFreePort());
     $serv->set(array(
         "worker_num" => 1,
         'pid_file' => PID_FILE,
         'log_file' => '/dev/null',
     ));
-    $serv->on("WorkerStart", function (\swoole_server $serv)  use ($pm)
+    $serv->on("WorkerStart", function (Server $serv)  use ($pm)
     {
         $pm->wakeup();
     });
-    $serv->on('receive', function (swoole_server $serv, $fd, $rid, $data)
+    $serv->on('receive', function (Server $serv, $fd, $rid, $data)
     {
 
     });
@@ -45,8 +41,6 @@ $pm->childFunc = function () use ($pm, $port)
 $pm->childFirst();
 $pm->run();
 clearstatcache();
-assert(!is_file(PID_FILE));
+Assert::assert(!is_file(PID_FILE));
 ?>
-
 --EXPECT--
-

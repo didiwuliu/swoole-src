@@ -14,106 +14,62 @@
   +----------------------------------------------------------------------+
 */
 
-#include "channel.h"
+#include "coroutine_channel.h"
 
+#include <unordered_map>
+
+using swoole::coroutine::Channel;
 using namespace swoole;
 
-static void channel_defer_callback(void *data)
-{
-    notify_msg_t *msg = (notify_msg_t*) data;
-    coroutine_t *co = msg->chan->pop_coroutine(msg->type);
-    coroutine_resume(co);
-    delete msg;
-}
-
-static void channel_pop_timeout(swTimer *timer, swTimer_node *tnode)
-{
-    timeout_msg_t *msg = (timeout_msg_t *) tnode->data;
+void Channel::timer_callback(swTimer *timer, swTimer_node *tnode) {
+    timer_msg_t *msg = (timer_msg_t *) tnode->data;
     msg->error = true;
     msg->timer = nullptr;
-    msg->chan->remove(msg->co);
-    coroutine_resume(msg->co);
-}
-
-Channel::Channel(size_t _capacity)
-{
-    capacity = _capacity;
-    closed = false;
-    notify_producer_count = 0;
-    notify_consumer_count = 0;
-}
-
-void Channel::yield(enum channel_op type)
-{
-    int _cid = coroutine_get_current_cid();
-    if (_cid == -1)
-    {
-        swError("Socket::yield() must be called in the coroutine.");
+    if (msg->type == CONSUMER) {
+        msg->chan->consumer_remove(msg->co);
+    } else {
+        msg->chan->producer_remove(msg->co);
     }
-    coroutine_t *co = coroutine_get_by_id(_cid);
-    if (type == PRODUCER)
-    {
+    msg->co->resume();
+}
+
+void Channel::yield(enum opcode type) {
+    Coroutine *co = Coroutine::get_current_safe();
+    if (type == PRODUCER) {
         producer_queue.push_back(co);
-        swDebug("producer[%d]", coroutine_get_cid(co));
-    }
-    else
-    {
+        swTraceLog(SW_TRACE_CHANNEL, "producer cid=%ld", co->get_cid());
+    } else {
         consumer_queue.push_back(co);
-        swDebug("consumer[%d]", coroutine_get_cid(co));
+        swTraceLog(SW_TRACE_CHANNEL, "consumer cid=%ld", co->get_cid());
     }
-    coroutine_yield(co);
+    co->yield();
 }
 
-void Channel::notify(enum channel_op type)
-{
-    notify_msg_t *msg = new notify_msg_t;
-    msg->chan = this;
-    msg->type = type;
-    if (type == PRODUCER)
-    {
-        notify_producer_count++;
-    }
-    else
-    {
-        notify_consumer_count++;
-    }
-    SwooleG.main_reactor->defer(SwooleG.main_reactor, channel_defer_callback, msg);
-}
-
-void* Channel::pop(double timeout)
-{
-    if (closed)
-    {
-        return false;
-    }
-    timeout_msg_t msg;
-    msg.error = false;
-    if (timeout > 0)
-    {
-        int msec = (int) (timeout * 1000);
-        if (SwooleG.timer.fd == 0)
-        {
-            swTimer_init (msec);
-        }
-        msg.chan = this;
-        msg.co = coroutine_get_by_id(coroutine_get_current_cid());
-        msg.timer = SwooleG.timer.add(&SwooleG.timer, msec, 0, &msg, channel_pop_timeout);
-    }
-    else
-    {
-        msg.timer = NULL;
-    }
-    if (is_empty() || consumer_queue.size() > 0)
-    {
-        yield(CONSUMER);
-    }
-    if (msg.timer)
-    {
-        swTimer_del(&SwooleG.timer, msg.timer);
-    }
-    if (msg.error || closed)
-    {
+void *Channel::pop(double timeout) {
+    Coroutine *current_co = Coroutine::get_current_safe();
+    if (closed) {
         return nullptr;
+    }
+    if (is_empty() || !consumer_queue.empty()) {
+        timer_msg_t msg;
+        msg.error = false;
+        msg.timer = nullptr;
+        if (timeout > 0) {
+            long msec = (long) (timeout * 1000);
+            msg.chan = this;
+            msg.type = CONSUMER;
+            msg.co = current_co;
+            msg.timer = swoole_timer_add(msec, SW_FALSE, timer_callback, &msg);
+        }
+
+        yield(CONSUMER);
+
+        if (msg.timer) {
+            swoole_timer_del(msg.timer);
+        }
+        if (msg.error || closed) {
+            return nullptr;
+        }
     }
     /**
      * pop data
@@ -123,57 +79,67 @@ void* Channel::pop(double timeout)
     /**
      * notify producer
      */
-    if (producer_queue.size() > 0 && notify_producer_count < producer_queue.size())
-    {
-        notify(PRODUCER);
+    if (!producer_queue.empty()) {
+        Coroutine *co = pop_coroutine(PRODUCER);
+        co->resume();
     }
     return data;
 }
 
-bool Channel::push(void *data)
-{
-    if (closed)
-    {
+bool Channel::push(void *data, double timeout) {
+    Coroutine *current_co = Coroutine::get_current_safe();
+    if (closed) {
         return false;
     }
-    if (is_full() || producer_queue.size() > 0)
-    {
+    if (is_full() || !producer_queue.empty()) {
+        timer_msg_t msg;
+        msg.error = false;
+        msg.timer = nullptr;
+        if (timeout > 0) {
+            long msec = (long) (timeout * 1000);
+            msg.chan = this;
+            msg.type = PRODUCER;
+            msg.co = current_co;
+            msg.timer = swoole_timer_add(msec, SW_FALSE, timer_callback, &msg);
+        }
+
         yield(PRODUCER);
-    }
-    if (closed)
-    {
-        return false;
+
+        if (msg.timer) {
+            swoole_timer_del(msg.timer);
+        }
+        if (msg.error || closed) {
+            return false;
+        }
     }
     /**
      * push data
      */
     data_queue.push(data);
-    swDebug("push data, count=%ld", length());
+    swTraceLog(SW_TRACE_CHANNEL, "push data to channel, count=%ld", length());
     /**
      * notify consumer
      */
-    if (consumer_queue.size() > 0 && notify_consumer_count < consumer_queue.size())
-    {
-        notify(CONSUMER);
+    if (!consumer_queue.empty()) {
+        Coroutine *co = pop_coroutine(CONSUMER);
+        co->resume();
     }
     return true;
 }
 
-bool Channel::close()
-{
-    if (closed)
-    {
+bool Channel::close() {
+    if (closed) {
         return false;
     }
-    swDebug("closed");
+    swTraceLog(SW_TRACE_CHANNEL, "channel closed");
     closed = true;
-    while (producer_queue.size() > 0 && notify_producer_count < producer_queue.size())
-    {
-        notify(PRODUCER);
+    while (!producer_queue.empty()) {
+        Coroutine *co = pop_coroutine(PRODUCER);
+        co->resume();
     }
-    while (consumer_queue.size() > 0 && notify_consumer_count < consumer_queue.size())
-    {
-        notify(CONSUMER);
+    while (!consumer_queue.empty()) {
+        Coroutine *co = pop_coroutine(CONSUMER);
+        co->resume();
     }
     return true;
 }
